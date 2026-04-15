@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { initialConflicts, initialOutbox, initialSyncRuns, mabDatabases, sourceConnections } from "./data";
 import type {
   ConflictItem,
@@ -25,6 +25,38 @@ interface WorkspaceState {
   conflicts: ConflictItem[];
   syncRuns: SyncRun[];
   apiBase: string;
+}
+
+interface ApiEnvelope<T> {
+  ok: boolean;
+  data: T;
+}
+
+interface ApiCollection {
+  id: string;
+  sourceId: string;
+  externalId: string | null;
+  name: string;
+  kind: string;
+  schema: Record<string, { type?: string }>;
+  views: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  lastSyncedAt: string | null;
+}
+
+interface ApiRecord {
+  id: string;
+  sourceId: string;
+  collectionId: string;
+  externalId: string | null;
+  title: string;
+  status: string;
+  url: string | null;
+  properties: Record<string, unknown>;
+  content: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  archived: boolean;
+  lastSyncedAt: string | null;
 }
 
 function seedState(): WorkspaceState {
@@ -133,6 +165,135 @@ function sourceLabel(source: SourceType) {
   }[source];
 }
 
+function sourceTypeForCollection(collection: ApiCollection): SourceType {
+  if (collection.kind === "drive_files") return "google-drive";
+  if (collection.kind === "calendar_events") return "google-calendar";
+  if (collection.kind === "gmail_messages") return "gmail";
+  return "cloudflare";
+}
+
+function fieldTypeForApi(type: string | undefined): Field["type"] {
+  return {
+    title: "title",
+    text: "text",
+    rich_text: "text",
+    status: "status",
+    select: "select",
+    multi_select: "multi",
+    date: "datetime",
+    number: "number",
+    url: "url",
+    email: "email",
+    person: "person",
+    people: "person",
+    checkbox: "checkbox",
+  }[type ?? "text"] as Field["type"];
+}
+
+function valueFromApi(value: unknown): RecordValue {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.map((item) => (typeof item === "string" ? item : JSON.stringify(item)));
+  return JSON.stringify(value);
+}
+
+function titleKeyForFields(fields: Field[]) {
+  return fields.find((field) => field.type === "title")?.key ?? fields[0]?.key ?? "title";
+}
+
+function liveViewsFor(collection: ApiCollection, fields: Field[]): DatabaseView[] {
+  const visibleFields = fields.slice(0, Math.min(7, fields.length)).map((field) => field.key);
+  const dateField = fields.find((field) => field.type === "date" || field.type === "datetime")?.key;
+  const statusField = fields.find((field) => field.type === "status" || field.key === "status")?.key;
+  const views: DatabaseView[] = [{ id: `${collection.id}-table`, name: "Table", type: "table", fields: visibleFields, sortBy: dateField }];
+  if (statusField) views.push({ id: `${collection.id}-board`, name: "Board", type: "board", fields: visibleFields, groupBy: statusField });
+  views.push({ id: `${collection.id}-list`, name: "List", type: "list", fields: visibleFields, sortBy: dateField });
+  if (collection.kind === "calendar_events" && dateField) {
+    views.push({ id: `${collection.id}-calendar`, name: "Calendar", type: "calendar", fields: visibleFields, sortBy: dateField });
+  }
+  if (collection.kind === "drive_files") {
+    views.push({ id: `${collection.id}-gallery`, name: "Gallery", type: "gallery", fields: visibleFields, sortBy: dateField });
+  }
+  return views;
+}
+
+function databaseFromApi(collection: ApiCollection, records: ApiRecord[]): Database {
+  const sourceType = sourceTypeForCollection(collection);
+  const schemaFields = Object.entries(collection.schema ?? {}).map(([key, value]) => ({
+    key,
+    label: key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()),
+    type: fieldTypeForApi(value?.type),
+    width: key === "snippet" ? 320 : key === "name" || key === "subject" || key === "summary" ? 260 : 160,
+    sourceKey: key,
+  }));
+  const statusField: Field = { key: "status", label: "Status", type: "status", width: 120, sourceKey: "status" };
+  const fields = schemaFields.some((field) => field.key === "status") ? schemaFields : [...schemaFields, statusField];
+  const titleKey = titleKeyForFields(fields);
+  const writeback = sourceType === "google-calendar" ? "supported" : "explicit-only";
+  const mappedRecords: RecordItem[] = records.map((record) => {
+    const values = Object.fromEntries(Object.entries(record.properties ?? {}).map(([key, value]) => [key, valueFromApi(value)]));
+    return {
+      id: record.id,
+      ...values,
+      [titleKey]: valueFromApi(record.properties?.[titleKey]) ?? record.title,
+      status: record.status,
+      _summary: valueFromApi(record.content?.summary ?? record.content?.snippet ?? record.content?.description) as string | undefined,
+      _links: record.url ? [record.url] : [],
+      _source: {
+        type: sourceType,
+        id: record.externalId ?? record.id,
+        url: record.url ?? undefined,
+        collectionId: collection.id,
+        capturedAt: record.lastSyncedAt ?? new Date().toISOString(),
+        writeback,
+      },
+    };
+  });
+  return {
+    id: collection.id,
+    name: collection.name,
+    shortName: sourceLabel(sourceType),
+    category: "Google Workspace",
+    description: `${collection.name} mirrored from the live Cloudflare Google Workspace sync.`,
+    source: `Cloudflare mirror: ${collection.externalId ?? collection.id}`,
+    sync: {
+      sourceType,
+      sourceId: collection.id,
+      state: "connected",
+      lastSyncedAt: collection.lastSyncedAt ?? new Date().toISOString(),
+      writeback,
+      notes: sourceType === "google-calendar" ? "Calendar records can be edited through the supported writeback boundary." : "Mirrored read sync with explicit user-triggered writeback only.",
+    },
+    fields,
+    views: liveViewsFor(collection, fields),
+    records: mappedRecords,
+    template: Object.fromEntries(fields.map((field) => [field.key, field.type === "multi" ? [] : ""])),
+  };
+}
+
+function mergeLiveDatabases(current: Database[], live: Database[]) {
+  const liveIds = new Set(live.map((database) => database.id));
+  return [...current.filter((database) => !liveIds.has(database.id)), ...live];
+}
+
+async function fetchLiveDatabases(apiBase: string): Promise<Database[]> {
+  const base = apiBase.replace(/\/$/, "");
+  const [collectionsResponse, recordsResponse] = await Promise.all([
+    fetch(`${base}/collections?sourceId=google-mab`),
+    fetch(`${base}/records?sourceId=google-mab&limit=250`),
+  ]);
+  if (!collectionsResponse.ok || !recordsResponse.ok) {
+    throw new Error(`Live mirror read failed: collections ${collectionsResponse.status}, records ${recordsResponse.status}`);
+  }
+  const collectionsBody = (await collectionsResponse.json()) as ApiEnvelope<ApiCollection[]>;
+  const recordsBody = (await recordsResponse.json()) as ApiEnvelope<ApiRecord[]>;
+  const recordsByCollection = new Map<string, ApiRecord[]>();
+  for (const record of recordsBody.data ?? []) {
+    recordsByCollection.set(record.collectionId, [...(recordsByCollection.get(record.collectionId) ?? []), record]);
+  }
+  return (collectionsBody.data ?? []).map((collection) => databaseFromApi(collection, recordsByCollection.get(collection.id) ?? []));
+}
+
 function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -144,6 +305,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [showBuilder, setShowBuilder] = useState(true);
   const [activePanel, setActivePanel] = useState<"builder" | "sources" | "outbox" | "runs">("builder");
+  const [liveStatus, setLiveStatus] = useState<"loading" | "connected" | "error">("loading");
 
   const activeDb = workspace.databases.find((database) => database.id === activeDbId) ?? workspace.databases[0];
   const [viewByDb, setViewByDb] = useState<Record<string, string>>(
@@ -174,6 +336,31 @@ export default function App() {
     setWorkspace(next);
     saveWorkspace(next);
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLiveDatabases(workspace.apiBase)
+      .then((liveDatabases) => {
+        if (cancelled || liveDatabases.length === 0) return;
+        setWorkspace((current) => {
+          const next = { ...current, databases: mergeLiveDatabases(current.databases, liveDatabases) };
+          saveWorkspace(next);
+          return next;
+        });
+        setViewByDb((current) => ({
+          ...Object.fromEntries(liveDatabases.map((database) => [database.id, database.views[0]?.id ?? ""])),
+          ...current,
+        }));
+        setActiveDbId((current) => (current === "clients" ? liveDatabases[0].id : current));
+        setLiveStatus("connected");
+      })
+      .catch(() => {
+        if (!cancelled) setLiveStatus("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.apiBase]);
 
   const queueOperation = (
     database: Database,
