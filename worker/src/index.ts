@@ -6,6 +6,7 @@ import {
   getCollections,
   getDashboardCounts,
   getOutbox,
+  getOAuthConnections,
   getRecord,
   getRecords,
   getSources,
@@ -33,6 +34,9 @@ import type {
 type Env = {
   APP_NAME: string;
   APP_ENV: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  APP_ENCRYPTION_KEY?: string;
   DB: D1Database;
   SYNC_KV: KVNamespace;
   ARTIFACTS: R2Bucket;
@@ -72,6 +76,7 @@ const router = createRouter<Env, SyncQueueMessage>([
   { method: "POST", pattern: "/outbox", handler: createOutboxHandler },
   { method: "POST", pattern: "/outbox/:outboxId/retry", handler: retryOutboxHandler },
   { method: "GET", pattern: "/oauth/:provider/start", handler: oauthStartHandler },
+  { method: "GET", pattern: "/oauth/:provider/callback", handler: oauthCallbackHandler },
   { method: "POST", pattern: "/oauth/:provider/callback", handler: oauthCallbackHandler },
   { method: "GET", pattern: "/oauth/:provider/status", handler: oauthStatusHandler }
 ]);
@@ -445,22 +450,44 @@ async function oauthStartHandler(
     return jsonError(405, "method_not_allowed", "Only GET is supported");
   }
   const provider = parseProvider(match.params.provider);
+  if (!isGoogleProvider(provider)) {
+    return jsonError(400, "unsupported_oauth_provider", "Notion OAuth is intentionally disabled because Notion is now a legacy migration source.");
+  }
+  const clientId = getGoogleClientId(env);
+  if (!clientId) {
+    return jsonError(503, "missing_google_client_id", "GOOGLE_CLIENT_ID is not configured as a Worker secret.");
+  }
   const state = crypto.randomUUID();
   const challenge = crypto.randomUUID().replaceAll("-", "");
+  const redirectUri = googleRedirectUri(request);
+  const scopes = googleScopes(provider);
   await env.SYNC_KV.put(
     `oauth:start:${provider}:${state}`,
-    JSON.stringify({ provider, state, challenge, createdAt: new Date().toISOString() }),
+    JSON.stringify({ provider, state, challenge, redirectUri, scopes, createdAt: new Date().toISOString() }),
     { expirationTtl: 900 }
   );
+  await env.SYNC_KV.put(
+    `oauth:start:${state}`,
+    JSON.stringify({ provider, state, challenge, redirectUri, scopes, createdAt: new Date().toISOString() }),
+    { expirationTtl: 900 }
+  );
+  const authorizationUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  authorizationUrl.searchParams.set("client_id", clientId);
+  authorizationUrl.searchParams.set("redirect_uri", redirectUri);
+  authorizationUrl.searchParams.set("response_type", "code");
+  authorizationUrl.searchParams.set("scope", scopes.join(" "));
+  authorizationUrl.searchParams.set("state", state);
+  authorizationUrl.searchParams.set("access_type", "offline");
+  authorizationUrl.searchParams.set("prompt", "consent");
+  authorizationUrl.searchParams.set("include_granted_scopes", "true");
   const payload: OAuthStartResponse = {
     provider,
-    status: "placeholder",
-    authorizationUrl: null,
-    redirectUri: `${new URL(request.url).origin}/oauth/${provider}/callback`,
+    status: "ready",
+    authorizationUrl: authorizationUrl.toString(),
+    redirectUri,
     state,
     challenge,
-    instructions:
-      "Configure the provider credentials, register the redirect URI, and exchange the code in the callback endpoint."
+    instructions: "Open authorizationUrl, approve access, and Google will return to the callback endpoint automatically."
   };
   return jsonOk(payload);
 }
@@ -471,33 +498,52 @@ async function oauthCallbackHandler(
   _ctx: ExecutionContext,
   match: { params: Record<string, string> }
 ): Promise<Response> {
-  if (request.method !== "POST") {
-    return jsonError(405, "method_not_allowed", "Only POST is supported");
+  if (request.method !== "POST" && request.method !== "GET") {
+    return jsonError(405, "method_not_allowed", "Only GET and POST are supported");
   }
-  const provider = parseProvider(match.params.provider);
-  const body = await readJson<{ code?: string; state?: string; accountName?: string }>(request);
+  const routeProvider = parseProvider(match.params.provider);
+  if (!isGoogleProvider(routeProvider)) {
+    return jsonError(400, "unsupported_oauth_provider", "Notion OAuth is intentionally disabled because Notion is now a legacy migration source.");
+  }
+  const body =
+    request.method === "GET"
+      ? Object.fromEntries(new URL(request.url).searchParams.entries())
+      : await readJson<{ code?: string; state?: string; accountName?: string }>(request);
+  const state = String(body.state ?? "");
+  const start = await readOAuthStart(env, state);
+  const provider = start?.provider ?? routeProvider;
+  const code = typeof body.code === "string" ? body.code : undefined;
+  if (!code) {
+    return jsonError(400, "missing_code", "Google did not provide an OAuth code.");
+  }
+  if (!start) {
+    return jsonError(400, "invalid_state", "OAuth state is missing or expired. Start the connection again.");
+  }
+  const token = await exchangeGoogleCode(env, code, start.redirectUri);
+  const encryptedToken = await encryptJson(env, token);
+  const grantedScopes = typeof token.scope === "string" ? token.scope.split(/\s+/).filter(Boolean) : start.scopes;
+  const account = await fetchGoogleAccount(token.access_token);
   const connection = await upsertOAuthConnection(env, {
-    provider,
-    status: body.code ? "placeholder" : "missing_code",
-    accountName: body.accountName ?? null,
-    scopes:
-      provider === "gmail"
-        ? ["gmail.readonly", "gmail.compose"]
-        : provider === "calendar"
-          ? ["calendar.events.readonly", "calendar.events"]
-          : ["read", "write"],
+    provider: "google",
+    status: token.refresh_token ? "connected" : "connected_no_refresh_token",
+    externalAccountId: account.sub ?? account.email ?? null,
+    accountName: account.email ?? body.accountName ?? "Google Workspace",
+    scopes: grantedScopes,
     metadata: {
-      codeReceived: Boolean(body.code),
-      stateReceived: Boolean(body.state),
-      provider
+      requestedProvider: provider,
+      connectedProviders: ["google", "calendar", "gmail"],
+      token: encryptedToken,
+      tokenType: token.token_type ?? null,
+      expiresAt: new Date(Date.now() + Number(token.expires_in ?? 0) * 1000).toISOString(),
+      hasRefreshToken: Boolean(token.refresh_token),
+      account
     }
   });
   const payload: OAuthCallbackResponse = {
-    provider,
-    status: "placeholder",
-    message: `OAuth callback received for ${provider}.`,
-    nextStep:
-      "Replace the placeholder exchange with the provider token endpoint and persist encrypted tokens."
+    provider: "google",
+    status: connection.status,
+    message: "Google OAuth is connected for Drive, Calendar, and Gmail scopes.",
+    nextStep: "The Worker can now use the encrypted refresh token for Google Workspace ingestion."
   };
   return jsonOk({
     connection,
@@ -515,13 +561,149 @@ async function oauthStatusHandler(
     return jsonError(405, "method_not_allowed", "Only GET is supported");
   }
   const provider = parseProvider(match.params.provider);
-  const state = await syncSeedState(env);
-  const connection = state.oauthConnections.find((item) => item.provider === provider) ?? null;
+  const connections = await getOAuthConnections(env);
+  const connection =
+    connections.find((item) => item.provider === provider) ??
+    (isGoogleProvider(provider) ? connections.find((item) => item.provider === "google") : null) ??
+    null;
   return jsonOk({
     provider,
     connection,
     status: connection?.status ?? "placeholder"
   });
+}
+
+type OAuthStartState = {
+  provider: Provider;
+  state: string;
+  challenge: string;
+  redirectUri: string;
+  scopes: string[];
+  createdAt: string;
+};
+
+type GoogleTokenResponse = {
+  access_token: string;
+  expires_in?: number;
+  refresh_token?: string;
+  scope?: string;
+  token_type?: string;
+  id_token?: string;
+};
+
+type GoogleAccount = {
+  sub?: string;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+  picture?: string;
+};
+
+function isGoogleProvider(provider: Provider): boolean {
+  return provider === "google" || provider === "calendar" || provider === "gmail";
+}
+
+function getGoogleClientId(env: Env): string | undefined {
+  return env.GOOGLE_CLIENT_ID;
+}
+
+function getGoogleClientSecret(env: Env): string | undefined {
+  return env.GOOGLE_CLIENT_SECRET;
+}
+
+function googleRedirectUri(request: Request): string {
+  return `${new URL(request.url).origin}/oauth/google/callback`;
+}
+
+function googleScopes(provider: Provider): string[] {
+  const identity = ["openid", "email", "profile"];
+  const drive = ["https://www.googleapis.com/auth/drive.readonly"];
+  const calendar = ["https://www.googleapis.com/auth/calendar.events"];
+  const gmail = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify"
+  ];
+  if (provider === "calendar") return [...identity, ...calendar];
+  if (provider === "gmail") return [...identity, ...gmail];
+  return [...identity, ...drive, ...calendar, ...gmail];
+}
+
+async function readOAuthStart(env: Env, state: string): Promise<OAuthStartState | null> {
+  if (!state) return null;
+  const raw = await env.SYNC_KV.get(`oauth:start:${state}`);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as OAuthStartState;
+    if (!isGoogleProvider(parsed.provider)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function exchangeGoogleCode(
+  env: Env,
+  code: string,
+  redirectUri: string
+): Promise<GoogleTokenResponse> {
+  const clientId = getGoogleClientId(env);
+  const clientSecret = getGoogleClientSecret(env);
+  if (!clientId || !clientSecret) {
+    throw new Error("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be configured as Worker secrets.");
+  }
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code"
+    })
+  });
+  const payload = (await response.json()) as GoogleTokenResponse & { error?: string; error_description?: string };
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error_description ?? payload.error ?? "Google token exchange failed.");
+  }
+  return payload;
+}
+
+async function fetchGoogleAccount(accessToken: string): Promise<GoogleAccount> {
+  const response = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { authorization: `Bearer ${accessToken}` }
+  });
+  if (!response.ok) {
+    return {};
+  }
+  return (await response.json()) as GoogleAccount;
+}
+
+async function encryptJson(env: Env, value: unknown): Promise<string> {
+  if (!env.APP_ENCRYPTION_KEY) {
+    throw new Error("APP_ENCRYPTION_KEY must be configured as a Worker secret before storing OAuth tokens.");
+  }
+  const keyMaterial = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(env.APP_ENCRYPTION_KEY)
+  );
+  const key = await crypto.subtle.importKey("raw", keyMaterial, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(value))
+  );
+  return `v1:${base64UrlEncode(iv)}:${base64UrlEncode(new Uint8Array(encrypted))}`;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
 async function runSync(

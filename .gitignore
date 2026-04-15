@@ -5,5 +5,8 @@ macos/MABDatabaseOS/.build/
 .wrangler/
 output/
 .playwright-cli/
+*oauth*.json
+*client_secret*.json
+*credentials*.json
 *.tsbuildinfo
 .DS_Store

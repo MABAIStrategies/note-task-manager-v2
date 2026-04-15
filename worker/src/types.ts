@@ -151,8 +151,8 @@ export interface OutboxCreateBody {
 
 export interface OAuthStartResponse {
   provider: Provider;
-  status: "placeholder";
-  authorizationUrl: null;
+  status: "placeholder" | "ready";
+  authorizationUrl: string | null;
   redirectUri: string;
   state: string;
   challenge: string;
@@ -161,7 +161,7 @@ export interface OAuthStartResponse {
 
 export interface OAuthCallbackResponse {
   provider: Provider;
-  status: "placeholder";
+  status: string;
   message: string;
   nextStep: string;
 }
