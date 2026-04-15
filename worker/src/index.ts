@@ -572,9 +572,30 @@ async function oauthStatusHandler(
     null;
   return jsonOk({
     provider,
-    connection,
+    connection: connection ? sanitizeOAuthConnection(connection) : null,
     status: connection?.status ?? "placeholder"
   });
+}
+
+function sanitizeOAuthConnection(
+  connection: Awaited<ReturnType<typeof getOAuthConnections>>[number]
+): JsonObject {
+  return {
+    id: connection.id,
+    provider: connection.provider,
+    status: connection.status,
+    externalAccountId: connection.externalAccountId,
+    accountName: connection.accountName,
+    scopes: connection.scopes,
+    tokenExpiresAt: connection.tokenExpiresAt,
+    metadata: {
+      connectedProviders: connection.metadata.connectedProviders ?? [],
+      hasRefreshToken: connection.metadata.hasRefreshToken ?? false,
+      requestedProvider: connection.metadata.requestedProvider ?? null
+    },
+    createdAt: connection.createdAt,
+    updatedAt: connection.updatedAt
+  };
 }
 
 type OAuthStartState = {
