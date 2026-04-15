@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+macos/MABDatabaseOS/.build/
+.wrangler/
+output/
+.playwright-cli/
+*.tsbuildinfo
+.DS_Store
