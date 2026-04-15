@@ -96,7 +96,7 @@ export default {
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(
       createScheduledSync(env, {
-        provider: "notion",
+        provider: "google",
         mode: "incremental",
         seedOnly: !(await hasPersistedData(env))
       })
@@ -289,7 +289,7 @@ async function updateRecordOutboxHandler(
     return jsonError(404, "record_not_found", `Unknown record ${match.params.recordId}`);
   }
   const outbox = await createOutboxRow(env, {
-    provider: body.provider ?? "notion",
+    provider: body.provider ?? "google",
     operation: "update",
     sourceId: record.sourceId,
     collectionId: record.collectionId,
@@ -322,7 +322,7 @@ async function createSyncRunHandler(
     return jsonError(405, "method_not_allowed", "Only POST is supported");
   }
   const body = await readJson<SyncRequestBody>(request);
-  const provider = body.provider ?? "notion";
+  const provider = body.provider ?? "google";
   const mode = body.mode ?? "manual";
   const run = await createSyncRunRow(env, {
     provider,
@@ -357,8 +357,8 @@ async function apiSyncHandler(
     return jsonError(405, "method_not_allowed", "Only POST is supported");
   }
   const body = await readJson<{ sources?: string[]; requestedAt?: string }>(request);
-  const requestedSources = body.sources?.length ? body.sources : ["notion"];
-  const provider = requestedSources.includes("notion") ? "notion" : "google";
+  const requestedSources = body.sources?.length ? body.sources : ["google", "calendar", "gmail"];
+  const provider = requestedSources.includes("notion") && requestedSources.length === 1 ? "notion" : "google";
   const run = await createSyncRunRow(env, {
     provider,
     sourceId: `${provider}-mab`,
@@ -731,6 +731,509 @@ function base64UrlEncode(bytes: Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
+function base64UrlDecode(value: string): Uint8Array<ArrayBuffer> {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+async function decryptJson<T>(env: Env, value: string): Promise<T> {
+  if (!env.APP_ENCRYPTION_KEY) {
+    throw new Error("APP_ENCRYPTION_KEY must be configured as a Worker secret before reading OAuth tokens.");
+  }
+  const [version, iv, ciphertext] = value.split(":");
+  if (version !== "v1" || !iv || !ciphertext) {
+    throw new Error("Unsupported encrypted OAuth token format.");
+  }
+  const keyMaterial = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(env.APP_ENCRYPTION_KEY)
+  );
+  const key = await crypto.subtle.importKey("raw", keyMaterial, "AES-GCM", false, ["decrypt"]);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64UrlDecode(iv) },
+    key,
+    base64UrlDecode(ciphertext)
+  );
+  return JSON.parse(new TextDecoder().decode(decrypted)) as T;
+}
+
+type GoogleOAuthMetadata = {
+  token?: string;
+  requestedProvider?: Provider;
+  connectedProviders?: string[];
+  tokenType?: string | null;
+  expiresAt?: string;
+  hasRefreshToken?: boolean;
+  account?: JsonObject;
+};
+
+type GoogleWorkspaceToken = GoogleTokenResponse & {
+  refresh_token?: string;
+};
+
+type GoogleDriveFile = {
+  id: string;
+  name?: string;
+  mimeType?: string;
+  webViewLink?: string;
+  modifiedTime?: string;
+  owners?: Array<{ displayName?: string; emailAddress?: string }>;
+  size?: string;
+};
+
+type GoogleCalendarEvent = {
+  id: string;
+  summary?: string;
+  htmlLink?: string;
+  status?: string;
+  start?: { dateTime?: string; date?: string; timeZone?: string };
+  end?: { dateTime?: string; date?: string; timeZone?: string };
+  attendees?: Array<{ email?: string; displayName?: string; responseStatus?: string }>;
+  organizer?: { email?: string; displayName?: string };
+  location?: string;
+  description?: string;
+  updated?: string;
+};
+
+type GoogleGmailMessageListItem = {
+  id: string;
+  threadId?: string;
+};
+
+type GoogleGmailMessage = {
+  id: string;
+  threadId?: string;
+  labelIds?: string[];
+  snippet?: string;
+  internalDate?: string;
+  payload?: {
+    headers?: Array<{ name?: string; value?: string }>;
+  };
+};
+
+async function getGoogleWorkspaceAccess(env: Env): Promise<{
+  accessToken: string;
+  accountName: string | null;
+  scopes: string[];
+  metadata: GoogleOAuthMetadata;
+}> {
+  const connections = await getOAuthConnections(env);
+  const connection = connections.find((item) => item.provider === "google");
+  const metadata = (connection?.metadata ?? {}) as GoogleOAuthMetadata;
+  if (!connection || connection.status === "placeholder") {
+    throw new Error("Google OAuth is not connected. Open /oauth/google/start first.");
+  }
+  if (typeof metadata.token !== "string") {
+    throw new Error("Google OAuth connection is missing its encrypted token.");
+  }
+  const token = await decryptJson<GoogleWorkspaceToken>(env, metadata.token);
+  if (!token.refresh_token) {
+    throw new Error("Google OAuth connection has no refresh token. Reconnect with consent prompt.");
+  }
+  const refreshed = await refreshGoogleToken(env, token.refresh_token);
+  const mergedToken: GoogleWorkspaceToken = {
+    ...token,
+    ...refreshed,
+    refresh_token: refreshed.refresh_token ?? token.refresh_token
+  };
+  const expiresAt = new Date(Date.now() + Number(mergedToken.expires_in ?? 3600) * 1000).toISOString();
+  const encryptedToken = await encryptJson(env, mergedToken);
+  const scopes =
+    typeof mergedToken.scope === "string"
+      ? mergedToken.scope.split(/\s+/).filter(Boolean)
+      : connection.scopes;
+  await upsertOAuthConnection(env, {
+    provider: "google",
+    status: "connected",
+    externalAccountId: connection.externalAccountId,
+    accountName: connection.accountName,
+    scopes,
+    metadata: {
+      requestedProvider: metadata.requestedProvider ?? "google",
+      connectedProviders: ["google", "calendar", "gmail"],
+      token: encryptedToken,
+      tokenType: mergedToken.token_type ?? metadata.tokenType ?? null,
+      expiresAt,
+      hasRefreshToken: true,
+      account: metadata.account ?? {}
+    }
+  });
+  return {
+    accessToken: mergedToken.access_token,
+    accountName: connection.accountName,
+    scopes,
+    metadata: {
+      ...metadata,
+      tokenType: mergedToken.token_type ?? metadata.tokenType ?? null,
+      expiresAt,
+      hasRefreshToken: true
+    }
+  };
+}
+
+async function refreshGoogleToken(env: Env, refreshToken: string): Promise<GoogleTokenResponse> {
+  const clientId = getGoogleClientId(env);
+  const clientSecret = getGoogleClientSecret(env);
+  if (!clientId || !clientSecret) {
+    throw new Error("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be configured as Worker secrets.");
+  }
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token"
+    })
+  });
+  const payload = (await response.json()) as GoogleTokenResponse & { error?: string; error_description?: string };
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error_description ?? payload.error ?? "Google token refresh failed.");
+  }
+  return payload;
+}
+
+async function fetchGoogleJson<T>(accessToken: string, url: URL | string): Promise<T> {
+  const response = await fetch(url.toString(), {
+    headers: { authorization: `Bearer ${accessToken}` }
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = payload as { error?: { message?: string }; error_description?: string };
+    throw new Error(error.error?.message ?? error.error_description ?? `Google API request failed with ${response.status}`);
+  }
+  return payload as T;
+}
+
+async function fetchGoogleDriveFiles(accessToken: string): Promise<GoogleDriveFile[]> {
+  const url = new URL("https://www.googleapis.com/drive/v3/files");
+  url.searchParams.set("pageSize", "60");
+  url.searchParams.set("orderBy", "modifiedTime desc");
+  url.searchParams.set("q", "trashed = false");
+  url.searchParams.set(
+    "fields",
+    "files(id,name,mimeType,webViewLink,modifiedTime,owners(displayName,emailAddress),size),nextPageToken"
+  );
+  const payload = await fetchGoogleJson<{ files?: GoogleDriveFile[] }>(accessToken, url);
+  return payload.files ?? [];
+}
+
+async function fetchGoogleCalendarEvents(accessToken: string): Promise<GoogleCalendarEvent[]> {
+  const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+  url.searchParams.set("singleEvents", "true");
+  url.searchParams.set("orderBy", "startTime");
+  url.searchParams.set("maxResults", "60");
+  url.searchParams.set("timeMin", new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+  url.searchParams.set("timeMax", new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString());
+  const payload = await fetchGoogleJson<{ items?: GoogleCalendarEvent[] }>(accessToken, url);
+  return payload.items ?? [];
+}
+
+async function fetchGoogleGmailMessages(accessToken: string): Promise<GoogleGmailMessage[]> {
+  const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+  listUrl.searchParams.set("q", "newer_than:90d");
+  listUrl.searchParams.set("maxResults", "35");
+  const payload = await fetchGoogleJson<{ messages?: GoogleGmailMessageListItem[] }>(accessToken, listUrl);
+  const messages: GoogleGmailMessage[] = [];
+  for (const item of payload.messages ?? []) {
+    const messageUrl = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${item.id}`);
+    messageUrl.searchParams.set("format", "metadata");
+    messageUrl.searchParams.append("metadataHeaders", "Subject");
+    messageUrl.searchParams.append("metadataHeaders", "From");
+    messageUrl.searchParams.append("metadataHeaders", "Date");
+    const message = await fetchGoogleJson<GoogleGmailMessage>(accessToken, messageUrl);
+    messages.push(message);
+  }
+  return messages;
+}
+
+async function runGoogleWorkspaceSync(
+  env: Env,
+  runId: string,
+  input: {
+    provider: Provider;
+    mode: SyncRequestBody["mode"];
+    seedOnly: boolean;
+  }
+): Promise<void> {
+  const access = await getGoogleWorkspaceAccess(env);
+  const [driveFiles, calendarEvents, gmailMessages] = await Promise.all([
+    fetchGoogleDriveFiles(access.accessToken),
+    fetchGoogleCalendarEvents(access.accessToken),
+    fetchGoogleGmailMessages(access.accessToken)
+  ]);
+  const source = googleWorkspaceSource(access.accountName);
+  const collections = googleWorkspaceCollections(source.id);
+  const records = [
+    ...driveFiles.map((file) => driveFileRecord(source.id, file)),
+    ...calendarEvents.map((event) => calendarEventRecord(source.id, event)),
+    ...gmailMessages.map((message) => gmailMessageRecord(source.id, message))
+  ];
+  await persistMockData(env, source, collections, records);
+  await env.ARTIFACTS.put(
+    `google-sync-runs/${runId}.json`,
+    JSON.stringify(
+      {
+        runId,
+        generatedAt: new Date().toISOString(),
+        provider: input.provider,
+        mode: input.mode ?? "manual",
+        accountName: access.accountName,
+        counts: {
+          driveFiles: driveFiles.length,
+          calendarEvents: calendarEvents.length,
+          gmailMessages: gmailMessages.length,
+          records: records.length
+        },
+        driveFiles,
+        calendarEvents,
+        gmailMessages: gmailMessages.map((message) => ({
+          id: message.id,
+          threadId: message.threadId,
+          labelIds: message.labelIds,
+          snippet: message.snippet,
+          headers: message.payload?.headers ?? []
+        }))
+      },
+      null,
+      2
+    ),
+    { httpMetadata: { contentType: "application/json" } }
+  );
+  await updateSyncRunRow(env, runId, {
+    status: "succeeded",
+    result: {
+      provider: input.provider,
+      mode: input.mode ?? "manual",
+      sourceId: source.id,
+      collections: collections.length,
+      records: records.length,
+      seedOnly: input.seedOnly,
+      counts: {
+        driveFiles: driveFiles.length,
+        calendarEvents: calendarEvents.length,
+        gmailMessages: gmailMessages.length
+      }
+    },
+    finishedAt: new Date().toISOString()
+  });
+}
+
+function googleWorkspaceSource(accountName: string | null): SeedSourceDescriptor {
+  return {
+    id: "google-mab",
+    provider: "google",
+    name: "MAB AI Strategies Google Workspace",
+    workspaceName: accountName ?? "MAB AI Strategies",
+    authState: "connected",
+    baseUrl: "https://workspace.google.com",
+    externalWorkspaceId: accountName,
+    metadata: {
+      mirroredProviders: ["google-drive", "google-calendar", "gmail"],
+      syncModel: "mirror",
+      writeback: {
+        calendar: "event edits",
+        gmail: "explicit drafts and labels",
+        drive: "metadata and app-side records"
+      }
+    }
+  };
+}
+
+function googleWorkspaceCollections(sourceId: string): SeedCollectionDescriptor[] {
+  return [
+    {
+      id: "google-drive-files",
+      sourceId,
+      externalId: "drive.files",
+      parentCollectionId: null,
+      name: "Google Drive Files",
+      kind: "drive_files",
+      isInline: false,
+      schema: {
+        name: { type: "title" },
+        mimeType: { type: "text" },
+        modifiedTime: { type: "date" },
+        owner: { type: "person" },
+        size: { type: "number" },
+        source: { type: "url" }
+      },
+      views: {
+        default: "table",
+        table: { sort: [{ property: "modifiedTime", direction: "descending" }] },
+        gallery: { cover: "mimeType", title: "name" }
+      },
+      metadata: { sourceProduct: "google-drive" }
+    },
+    {
+      id: "google-calendar-events",
+      sourceId,
+      externalId: "calendar.primary.events",
+      parentCollectionId: null,
+      name: "Google Calendar Events",
+      kind: "calendar_events",
+      isInline: false,
+      schema: {
+        summary: { type: "title" },
+        start: { type: "date" },
+        end: { type: "date" },
+        organizer: { type: "person" },
+        attendees: { type: "number" },
+        location: { type: "text" },
+        source: { type: "url" }
+      },
+      views: {
+        default: "calendar",
+        calendar: { dateProperty: "start" },
+        table: { sort: [{ property: "start", direction: "ascending" }] }
+      },
+      metadata: { sourceProduct: "google-calendar" }
+    },
+    {
+      id: "google-gmail-messages",
+      sourceId,
+      externalId: "gmail.messages",
+      parentCollectionId: null,
+      name: "Gmail Messages",
+      kind: "gmail_messages",
+      isInline: false,
+      schema: {
+        subject: { type: "title" },
+        from: { type: "email" },
+        date: { type: "date" },
+        threadId: { type: "text" },
+        labels: { type: "multi_select" },
+        snippet: { type: "text" }
+      },
+      views: {
+        default: "list",
+        table: { sort: [{ property: "date", direction: "descending" }] },
+        list: { title: "subject", subtitle: "from" }
+      },
+      metadata: { sourceProduct: "gmail" }
+    }
+  ];
+}
+
+function driveFileRecord(sourceId: string, file: GoogleDriveFile): SeedRecordDescriptor {
+  const owner = file.owners?.[0];
+  return {
+    id: stableRecordId("google-drive", file.id),
+    sourceId,
+    collectionId: "google-drive-files",
+    externalId: file.id,
+    title: file.name ?? "Untitled Drive file",
+    status: "active",
+    url: file.webViewLink ?? null,
+    properties: {
+      name: file.name ?? "Untitled Drive file",
+      mimeType: file.mimeType ?? "unknown",
+      modifiedTime: file.modifiedTime ?? null,
+      owner: owner?.emailAddress ?? owner?.displayName ?? null,
+      size: file.size ? Number(file.size) : null,
+      source: file.webViewLink ?? null
+    },
+    relations: [],
+    content: {
+      summary: `${file.name ?? "Drive file"} from Google Drive`,
+      extractedTextStatus: "metadata-indexed"
+    },
+    metadata: {
+      sourceProduct: "google-drive",
+      owners: file.owners ?? [],
+      rawMimeType: file.mimeType ?? null
+    },
+    archived: false
+  };
+}
+
+function calendarEventRecord(sourceId: string, event: GoogleCalendarEvent): SeedRecordDescriptor {
+  const start = event.start?.dateTime ?? event.start?.date ?? null;
+  const end = event.end?.dateTime ?? event.end?.date ?? null;
+  return {
+    id: stableRecordId("google-calendar", event.id),
+    sourceId,
+    collectionId: "google-calendar-events",
+    externalId: event.id,
+    title: event.summary ?? "Untitled calendar event",
+    status: event.status ?? "confirmed",
+    url: event.htmlLink ?? null,
+    properties: {
+      summary: event.summary ?? "Untitled calendar event",
+      start,
+      end,
+      organizer: event.organizer?.email ?? event.organizer?.displayName ?? null,
+      attendees: event.attendees?.length ?? 0,
+      location: event.location ?? null,
+      source: event.htmlLink ?? null
+    },
+    relations: [],
+    content: {
+      description: compactText(event.description ?? ""),
+      timeZone: event.start?.timeZone ?? event.end?.timeZone ?? null
+    },
+    metadata: {
+      sourceProduct: "google-calendar",
+      updated: event.updated ?? null,
+      attendees: event.attendees ?? []
+    },
+    archived: event.status === "cancelled"
+  };
+}
+
+function gmailMessageRecord(sourceId: string, message: GoogleGmailMessage): SeedRecordDescriptor {
+  const subject = gmailHeader(message, "Subject") || "(no subject)";
+  const from = gmailHeader(message, "From") || null;
+  const date = gmailHeader(message, "Date") || (message.internalDate ? new Date(Number(message.internalDate)).toISOString() : null);
+  const threadId = message.threadId ?? message.id;
+  return {
+    id: stableRecordId("google-gmail", message.id),
+    sourceId,
+    collectionId: "google-gmail-messages",
+    externalId: message.id,
+    title: subject,
+    status: message.labelIds?.includes("UNREAD") ? "unread" : "read",
+    url: `https://mail.google.com/mail/u/0/#all/${threadId}`,
+    properties: {
+      subject,
+      from,
+      date,
+      threadId,
+      labels: message.labelIds ?? [],
+      snippet: message.snippet ?? ""
+    },
+    relations: [],
+    content: {
+      snippet: message.snippet ?? "",
+      bodyStatus: "metadata-indexed"
+    },
+    metadata: {
+      sourceProduct: "gmail",
+      headers: message.payload?.headers ?? []
+    },
+    archived: false
+  };
+}
+
+function gmailHeader(message: GoogleGmailMessage, name: string): string | undefined {
+  return message.payload?.headers?.find((header) => header.name?.toLowerCase() === name.toLowerCase())?.value;
+}
+
+function stableRecordId(prefix: string, externalId: string): string {
+  return `${prefix}-${externalId.replaceAll(/[^a-zA-Z0-9_-]/g, "_")}`;
+}
+
+function compactText(value: string): string {
+  return value.replaceAll(/<[^>]*>/g, " ").replaceAll(/\s+/g, " ").trim().slice(0, 2000);
+}
+
 async function runSync(
   env: Env,
   runId: string,
@@ -741,9 +1244,13 @@ async function runSync(
     seedOnly: boolean;
   }
 ): Promise<void> {
-  const adapter = createAdapter(input.provider);
   try {
     await updateSyncRunRow(env, runId, { status: "running" });
+    if (isGoogleProvider(input.provider)) {
+      await runGoogleWorkspaceSync(env, runId, input);
+      return;
+    }
+    const adapter = createAdapter(input.provider);
     const source = await adapter.discoverSource();
     const collections = await adapter.listCollections();
     const records = await adapter.listRecords();
