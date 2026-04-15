@@ -533,15 +533,15 @@ export const sourceConnections: SourceConnection[] = [
   { id: "google-drive", name: "Google Drive", state: "snapshot", detail: "Strategy docs, prospect spreadsheets, intake apps, org files, and research artifacts indexed.", lastSyncedAt: capturedAt, recordCount: mabDatabases.find((database) => database.id === "workspace-docs")?.records.length ?? 0, writeback: "Explicit document actions only" },
   { id: "gmail", name: "Gmail", state: "snapshot", detail: "MAB-related inbox, Chat notifications, receipts, and calendar notifications indexed.", lastSyncedAt: capturedAt, recordCount: mabDatabases.find((database) => database.id === "workspace-signals")?.records.length ?? 0, writeback: "Drafts and labels only" },
   { id: "google-calendar", name: "Google Calendar", state: "snapshot", detail: "SOW/proposal business operations block mapped into deals, tasks, and interactions.", lastSyncedAt: capturedAt, recordCount: 2, writeback: "Event create/update after OAuth" },
-  { id: "cloudflare", name: "Cloudflare", state: "needs-auth", detail: "Worker, D1, KV, R2, Queue, and Cron backend scaffold is local until secrets are configured.", lastSyncedAt: "", recordCount: 0, writeback: "Private sync API" },
-  { id: "github", name: "GitHub", state: "needs-auth", detail: "Local codex branch exists. No remote or authenticated GitHub CLI session was detected.", lastSyncedAt: "", recordCount: 0, writeback: "Commit/push/PR after remote auth" },
+  { id: "cloudflare", name: "Cloudflare", state: "connected", detail: "Worker, D1, KV, Queue, Cron, and workers.dev endpoint are live. R2 waits on account enablement.", lastSyncedAt: capturedAt, recordCount: 4, writeback: "Private sync API" },
+  { id: "github", name: "GitHub", state: "connected", detail: "Public repo connected, branch pushed, and PR opened from the codex implementation branch.", lastSyncedAt: capturedAt, recordCount: 1, writeback: "Commit, push, and PR workflow" },
 ];
 
 export const initialSyncRuns: SyncRun[] = [
   { id: "sync-notion-snapshot", source: "notion", status: "success", startedAt: "2026-04-15T00:00:00-04:00", finishedAt: "2026-04-15T00:03:00-04:00", recordsSeen: 32, message: "Connector snapshot captured MAB AI Strategies teamspace schemas, views, and representative records." },
   { id: "sync-drive-snapshot", source: "google-drive", status: "success", startedAt: "2026-04-15T00:03:00-04:00", finishedAt: "2026-04-15T00:05:00-04:00", recordsSeen: 12, message: "Drive strategy and operating artifacts indexed from MAB queries." },
   { id: "sync-google-workspace", source: "gmail", status: "warning", startedAt: "2026-04-15T00:05:00-04:00", finishedAt: "2026-04-15T00:06:00-04:00", recordsSeen: 8, message: "Gmail and Calendar snapshots are read-only until OAuth writeback is configured." },
-  { id: "sync-cloudflare-local", source: "cloudflare", status: "queued", startedAt: "2026-04-15T00:06:00-04:00", recordsSeen: 0, message: "Backend scaffold awaits deployment bindings and OAuth secrets." },
+  { id: "sync-cloudflare-live", source: "cloudflare", status: "success", startedAt: "2026-04-15T03:24:00-04:00", finishedAt: "2026-04-15T03:25:00-04:00", recordsSeen: 4, message: "Cloudflare Worker, D1, KV, Queue, Cron, and workers.dev sync gateway are live." },
 ];
 
 export const initialOutbox: OutboxOperation[] = [

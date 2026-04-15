@@ -17,7 +17,7 @@ import type {
 const storageKey = "mab-database-os:v2";
 const defaultApiBase =
   ((import.meta as ImportMeta & { env?: Record<string, string> }).env?.VITE_SYNC_API_BASE as string | undefined) ??
-  "http://127.0.0.1:8787";
+  "https://mab-database-os-worker.mark-fc2.workers.dev";
 
 interface WorkspaceState {
   databases: Database[];
