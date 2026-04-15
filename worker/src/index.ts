@@ -489,6 +489,10 @@ async function oauthStartHandler(
     challenge,
     instructions: "Open authorizationUrl, approve access, and Google will return to the callback endpoint automatically."
   };
+  const wantsJson = new URL(request.url).searchParams.get("format") === "json";
+  if (!wantsJson) {
+    return Response.redirect(authorizationUrl.toString(), 302);
+  }
   return jsonOk(payload);
 }
 
