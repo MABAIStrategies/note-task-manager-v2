@@ -28,13 +28,14 @@ interface WorkspaceState {
   apiBase: string;
 }
 
-type OutlineNodeType = "title" | "heading" | "subheading" | "theme" | "database";
+type OutlineNodeType = "title" | "heading" | "subheading" | "theme" | "text" | "todo" | "divider" | "database";
 
 interface OutlineNode {
   id: string;
   title: string;
   type: OutlineNodeType;
   databaseId?: string;
+  checked?: boolean;
   children: OutlineNode[];
 }
 
@@ -165,6 +166,49 @@ function matchesSearch(database: Database, record: RecordItem, query: string) {
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function outlineTypeLabel(type: OutlineNodeType) {
+  return {
+    title: "page",
+    heading: "heading",
+    subheading: "subheading",
+    theme: "theme",
+    text: "text",
+    todo: "to-do",
+    divider: "divider",
+    database: "database",
+  }[type];
+}
+
+function newOutlineNode(type: OutlineNodeType, title?: string, databaseId?: string): OutlineNode {
+  return {
+    id: makeId("outline"),
+    title:
+      title ??
+      {
+        title: "Untitled",
+        heading: "Heading",
+        subheading: "Subheading",
+        theme: "Theme",
+        text: "Write something...",
+        todo: "To-do",
+        divider: "",
+        database: "New database",
+      }[type],
+    type,
+    databaseId,
+    checked: type === "todo" ? false : undefined,
+    children: [],
+  };
+}
+
+function cloneOutlineNode(node: OutlineNode): OutlineNode {
+  return {
+    ...node,
+    id: makeId("outline"),
+    children: node.children.map(cloneOutlineNode),
+  };
 }
 
 function defaultOutline(databases: Database[]): OutlineNode[] {
@@ -313,6 +357,21 @@ function insertAtPath(nodes: OutlineNode[], parentPath: number[], index: number,
     if (itemIndex !== parentIndex) return node;
     return { ...node, children: insertAtPath(node.children, rest, index, nodeToInsert) };
   });
+}
+
+function duplicateOutlineNode(nodes: OutlineNode[], id: string): OutlineNode[] {
+  const path = findPath(nodes, id);
+  if (!path) return nodes;
+  const node = getAtPath(nodes, path);
+  if (!node) return nodes;
+  return insertAtPath(nodes, path.slice(0, -1), path[path.length - 1] + 1, cloneOutlineNode(node));
+}
+
+function deleteOutlineNode(nodes: OutlineNode[], id: string): OutlineNode[] {
+  const path = findPath(nodes, id);
+  if (!path) return nodes;
+  const result = removeAtPath(nodes, path);
+  return result.removed ? result.nodes : nodes;
 }
 
 function moveOutlineNode(nodes: OutlineNode[], id: string, direction: "up" | "down" | "indent" | "outdent"): OutlineNode[] {
@@ -556,27 +615,31 @@ export default function App() {
   };
 
   const addOutlineChild = (parentId: string, type: OutlineNodeType = "theme") => {
-    const child: OutlineNode = {
-      id: makeId("outline"),
-      title: type === "database" ? "New database" : `New ${type}`,
-      type,
-      children: [],
-    };
+    const child = newOutlineNode(type);
     updateOutline(updateOutlineNode(workspace.outline, parentId, (node) => ({ ...node, children: [...node.children, child] })));
     setActiveOutlineId(child.id);
     setMode("structure");
   };
 
   const addOutlineTitle = () => {
-    const title: OutlineNode = {
-      id: makeId("outline"),
-      title: "New title",
-      type: "title",
-      children: [],
-    };
+    const title = newOutlineNode("title");
     updateOutline([...workspace.outline, title]);
     setActiveOutlineId(title.id);
     setMode("structure");
+  };
+
+  const duplicateOutline = (id: string) => {
+    updateOutline(duplicateOutlineNode(workspace.outline, id));
+  };
+
+  const deleteOutline = (id: string) => {
+    const next = deleteOutlineNode(workspace.outline, id);
+    updateOutline(next);
+    if (activeOutlineId === id) setActiveOutlineId(next[0]?.id ?? "");
+  };
+
+  const toggleOutlineTodo = (id: string, checked: boolean) => {
+    updateOutline(updateOutlineNode(workspace.outline, id, (node) => ({ ...node, checked })));
   };
 
   const moveOutline = (id: string, direction: "up" | "down" | "indent" | "outdent") => {
@@ -835,6 +898,8 @@ export default function App() {
         onRename={renameOutlineNode}
         onMove={moveOutline}
         onDrop={dropOutline}
+        onDuplicate={duplicateOutline}
+        onDelete={deleteOutline}
       />
       <main className="workspace">
         {mode === "structure" ? (
@@ -852,6 +917,9 @@ export default function App() {
             onRename={renameOutlineNode}
             onMove={moveOutline}
             onDrop={dropOutline}
+            onDuplicate={duplicateOutline}
+            onDelete={deleteOutline}
+            onToggleTodo={toggleOutlineTodo}
             onOpenDatabase={(databaseId) => {
               setActiveDbId(databaseId);
               setMode("database");
@@ -947,6 +1015,8 @@ function Sidebar({
   onRename,
   onMove,
   onDrop,
+  onDuplicate,
+  onDelete,
 }: {
   databases: Database[];
   outline: OutlineNode[];
@@ -958,6 +1028,8 @@ function Sidebar({
   onRename: (id: string, title: string) => void;
   onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
   onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
 }) {
   const totalRecords = databases.reduce((sum, database) => sum + database.records.length, 0);
   return (
@@ -970,9 +1042,9 @@ function Sidebar({
         </div>
       </div>
       <div className="side-search-card">
-        <span>Source state</span>
-        <strong>{connections.filter((connection) => connection.state === "snapshot" || connection.state === "connected").length} connected snapshots</strong>
-        <small>Rename, move, indent, and drag the structure.</small>
+        <span>Workspace</span>
+        <strong>{connections.filter((connection) => connection.state === "snapshot" || connection.state === "connected").length} connected sources</strong>
+        <small>Pages, blocks, databases, and source records.</small>
       </div>
       <nav className="nav-groups">
         {outline.map((node) => (
@@ -988,6 +1060,8 @@ function Sidebar({
             onRename={onRename}
             onMove={onMove}
             onDrop={onDrop}
+            onDuplicate={onDuplicate}
+            onDelete={onDelete}
           />
         ))}
       </nav>
@@ -1006,6 +1080,8 @@ function OutlineTreeItem({
   onRename,
   onMove,
   onDrop,
+  onDuplicate,
+  onDelete,
 }: {
   node: OutlineNode;
   level: number;
@@ -1017,6 +1093,8 @@ function OutlineTreeItem({
   onRename: (id: string, title: string) => void;
   onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
   onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
 }) {
   const database = node.databaseId ? databases.find((item) => item.id === node.databaseId) : null;
   const isActive = node.databaseId ? node.databaseId === activeDbId : node.id === activeOutlineId;
@@ -1038,16 +1116,18 @@ function OutlineTreeItem({
     >
       <div className={`outline-row ${isActive ? "active" : ""}`}>
         <button className="outline-open" onClick={select}>
-          <span>{node.type}</span>
+          <span>{outlineTypeLabel(node.type)}</span>
           <strong>{database?.shortName ?? node.title.slice(0, 2).toUpperCase()}</strong>
         </button>
         <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
         {database && <em>{database.records.length}</em>}
         <div className="move-controls">
+          <button title="Duplicate" onClick={() => onDuplicate(node.id)}>Copy</button>
           <button title="Move up" onClick={() => onMove(node.id, "up")}>Up</button>
           <button title="Move down" onClick={() => onMove(node.id, "down")}>Down</button>
           <button title="Indent" onClick={() => onMove(node.id, "indent")}>In</button>
           <button title="Outdent" onClick={() => onMove(node.id, "outdent")}>Out</button>
+          <button title="Delete" onClick={() => onDelete(node.id)}>Del</button>
         </div>
       </div>
       {node.children.length > 0 && (
@@ -1065,6 +1145,8 @@ function OutlineTreeItem({
               onRename={onRename}
               onMove={onMove}
               onDrop={onDrop}
+              onDuplicate={onDuplicate}
+              onDelete={onDelete}
             />
           ))}
         </div>
@@ -1087,6 +1169,9 @@ function StructureWorkspace({
   onRename,
   onMove,
   onDrop,
+  onDuplicate,
+  onDelete,
+  onToggleTodo,
   onOpenDatabase,
   onExport,
   onReset,
@@ -1105,6 +1190,9 @@ function StructureWorkspace({
   onRename: (id: string, title: string) => void;
   onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
   onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+  onToggleTodo: (id: string, checked: boolean) => void;
   onOpenDatabase: (databaseId: string) => void;
   onExport: () => void;
   onReset: () => void;
@@ -1113,33 +1201,40 @@ function StructureWorkspace({
   const totalRecords = databases.reduce((sum, database) => sum + database.records.length, 0);
   const selected = activeOutline ?? outline[0] ?? null;
   return (
-    <section className="structure-workspace">
+    <section className="structure-workspace notion-shell">
+      <header className="notion-topbar">
+        <div className="breadcrumb">
+          <span>Private</span>
+          <span>/</span>
+          <strong>{selected?.title ?? "Workspace"}</strong>
+        </div>
+        <div className="notion-actions">
+          <input className="notion-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${totalRecords} records`} />
+          <button onClick={onAddTitle}>New page</button>
+          <button onClick={onSync}>Sync</button>
+          <button onClick={onExport}>Export</button>
+          <details className="sync-details">
+            <summary>Settings</summary>
+            <div>
+              <label>
+                <span>Sync API</span>
+                <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
+              </label>
+              <button onClick={onReset}>Reset mirror</button>
+            </div>
+          </details>
+        </div>
+      </header>
       <header className="structure-header">
         <div>
-          <p className="eyebrow">Workspace structure</p>
+          <p className="eyebrow">MAB AI Strategies</p>
           <input
             className="editable-title"
             value={selected?.title ?? "Workspace"}
             onChange={(event) => selected && onRename(selected.id, event.target.value)}
             aria-label="Rename selected structure item"
           />
-          <p className="subtle">Build this like a note outline: titles, headings, subheadings, themes, data, and raw source references.</p>
-        </div>
-        <div className="structure-actions">
-          <label className="command-search">
-            <span>Search workspace</span>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${totalRecords} records`} />
-          </label>
-          <label className="api-field">
-            <span>Sync API</span>
-            <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
-          </label>
-          <div className="action-row">
-            <button className="secondary" onClick={onAddTitle}>Add title</button>
-            <button className="secondary" onClick={onExport}>Export</button>
-            <button className="secondary" onClick={onReset}>Reset mirror</button>
-            <button className="secondary" onClick={onSync}>Sync now</button>
-          </div>
+          <p className="subtle">Type into any block. Use the slash menu or block handles to build pages, sections, databases, and source references.</p>
         </div>
       </header>
       <div className="structure-status">
@@ -1150,14 +1245,19 @@ function StructureWorkspace({
       </div>
       {selected && (
         <div className="structure-toolbar">
-          <span>Selected: {selected.type}</span>
+          <span>Selected: {outlineTypeLabel(selected.type)}</span>
+          <button onClick={() => onAddChild(selected.id, "text")}>Text</button>
+          <button onClick={() => onAddChild(selected.id, "todo")}>To-do</button>
           <button onClick={() => onAddChild(selected.id, "heading")}>Add heading</button>
           <button onClick={() => onAddChild(selected.id, "subheading")}>Add subheading</button>
           <button onClick={() => onAddChild(selected.id, "theme")}>Add theme</button>
+          <button onClick={() => onAddChild(selected.id, "divider")}>Divider</button>
+          <button onClick={() => onDuplicate(selected.id)}>Duplicate</button>
           <button onClick={() => onMove(selected.id, "up")}>Move up</button>
           <button onClick={() => onMove(selected.id, "down")}>Move down</button>
           <button onClick={() => onMove(selected.id, "indent")}>Indent</button>
           <button onClick={() => onMove(selected.id, "outdent")}>Outdent</button>
+          <button onClick={() => onDelete(selected.id)}>Delete</button>
         </div>
       )}
       <div className="outline-canvas">
@@ -1171,6 +1271,9 @@ function StructureWorkspace({
             onRename={onRename}
             onMove={onMove}
             onDrop={onDrop}
+            onDuplicate={onDuplicate}
+            onDelete={onDelete}
+            onToggleTodo={onToggleTodo}
             onAddChild={onAddChild}
             onOpenDatabase={onOpenDatabase}
           />
@@ -1188,6 +1291,9 @@ function OutlineCanvasNode({
   onRename,
   onMove,
   onDrop,
+  onDuplicate,
+  onDelete,
+  onToggleTodo,
   onAddChild,
   onOpenDatabase,
 }: {
@@ -1198,6 +1304,9 @@ function OutlineCanvasNode({
   onRename: (id: string, title: string) => void;
   onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
   onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+  onToggleTodo: (id: string, checked: boolean) => void;
   onAddChild: (parentId: string, type?: OutlineNodeType) => void;
   onOpenDatabase: (databaseId: string) => void;
 }) {
@@ -1206,7 +1315,7 @@ function OutlineCanvasNode({
   const titleField = database ? getTitleField(database) : null;
   return (
     <article
-      className={`canvas-node ${node.type} level-${Math.min(level, 5)}`}
+      className={`canvas-node ${node.type} ${node.checked ? "done" : ""} level-${Math.min(level, 5)}`}
       draggable
       onDragStart={(event) => event.dataTransfer.setData("text/plain", node.id)}
       onDragOver={(event) => event.preventDefault()}
@@ -1217,15 +1326,26 @@ function OutlineCanvasNode({
       }}
     >
       <div className="canvas-line">
-        <span className="outline-bullet" />
-        <span className="node-type">{node.type}</span>
-        <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
+        <button className="block-handle" title="Drag block">::</button>
+        {node.type === "todo" && (
+          <input className="todo-check" type="checkbox" checked={Boolean(node.checked)} onChange={(event) => onToggleTodo(node.id, event.target.checked)} />
+        )}
+        {node.type !== "todo" && <span className="outline-bullet" />}
+        <span className="node-type">{outlineTypeLabel(node.type)}</span>
+        {node.type === "divider" ? (
+          <hr />
+        ) : (
+          <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
+        )}
         {database && <button className="button-link" onClick={() => onOpenDatabase(database.id)}>Open database</button>}
         <div className="move-controls">
+          <button onClick={() => onAddChild(node.id, "text")}>/</button>
+          <button onClick={() => onDuplicate(node.id)}>Copy</button>
           <button onClick={() => onMove(node.id, "up")}>Up</button>
           <button onClick={() => onMove(node.id, "down")}>Down</button>
           <button onClick={() => onMove(node.id, "indent")}>In</button>
           <button onClick={() => onMove(node.id, "outdent")}>Out</button>
+          <button onClick={() => onDelete(node.id)}>Del</button>
         </div>
       </div>
       {database && (
@@ -1243,10 +1363,7 @@ function OutlineCanvasNode({
         </div>
       )}
       {!database && (
-        <div className="node-add-row">
-          <button onClick={() => onAddChild(node.id, "theme")}>Add theme</button>
-          <button onClick={() => onAddChild(node.id, "subheading")}>Add subheading</button>
-        </div>
+        <SlashMenu parentId={node.id} onAddChild={onAddChild} />
       )}
       {node.children.length > 0 && (
         <div className="canvas-children">
@@ -1260,6 +1377,9 @@ function OutlineCanvasNode({
               onRename={onRename}
               onMove={onMove}
               onDrop={onDrop}
+              onDuplicate={onDuplicate}
+              onDelete={onDelete}
+              onToggleTodo={onToggleTodo}
               onAddChild={onAddChild}
               onOpenDatabase={onOpenDatabase}
             />
@@ -1267,6 +1387,20 @@ function OutlineCanvasNode({
         </div>
       )}
     </article>
+  );
+}
+
+function SlashMenu({ parentId, onAddChild }: { parentId: string; onAddChild: (parentId: string, type?: OutlineNodeType) => void }) {
+  return (
+    <div className="slash-menu">
+      <span>/</span>
+      <button onClick={() => onAddChild(parentId, "text")}>Text</button>
+      <button onClick={() => onAddChild(parentId, "todo")}>To-do</button>
+      <button onClick={() => onAddChild(parentId, "heading")}>Heading</button>
+      <button onClick={() => onAddChild(parentId, "subheading")}>Subheading</button>
+      <button onClick={() => onAddChild(parentId, "theme")}>Theme</button>
+      <button onClick={() => onAddChild(parentId, "divider")}>Divider</button>
+    </div>
   );
 }
 
