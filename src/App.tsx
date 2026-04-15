@@ -21,10 +21,21 @@ const defaultApiBase =
 
 interface WorkspaceState {
   databases: Database[];
+  outline: OutlineNode[];
   outbox: OutboxOperation[];
   conflicts: ConflictItem[];
   syncRuns: SyncRun[];
   apiBase: string;
+}
+
+type OutlineNodeType = "title" | "heading" | "subheading" | "theme" | "database";
+
+interface OutlineNode {
+  id: string;
+  title: string;
+  type: OutlineNodeType;
+  databaseId?: string;
+  children: OutlineNode[];
 }
 
 interface ApiEnvelope<T> {
@@ -62,6 +73,7 @@ interface ApiRecord {
 function seedState(): WorkspaceState {
   return {
     databases: mabDatabases,
+    outline: defaultOutline(mabDatabases),
     outbox: initialOutbox,
     conflicts: initialConflicts,
     syncRuns: initialSyncRuns,
@@ -75,8 +87,10 @@ function loadWorkspace(): WorkspaceState {
     if (!stored) return seedState();
     const parsed = JSON.parse(stored) as Partial<WorkspaceState>;
     if (!Array.isArray(parsed.databases)) return seedState();
+    const parsedOutline = Array.isArray(parsed.outline) ? parsed.outline : defaultOutline(parsed.databases);
     return {
       databases: parsed.databases,
+      outline: normalizeOutline(parsedOutline, parsed.databases),
       outbox: parsed.outbox ?? initialOutbox,
       conflicts: parsed.conflicts ?? initialConflicts,
       syncRuns: parsed.syncRuns ?? initialSyncRuns,
@@ -151,6 +165,199 @@ function matchesSearch(database: Database, record: RecordItem, query: string) {
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function defaultOutline(databases: Database[]): OutlineNode[] {
+  const byId = Object.fromEntries(databases.map((database) => [database.id, database]));
+  const node = (id: string, title: string, type: OutlineNodeType, children: OutlineNode[] = [], databaseId?: string): OutlineNode => ({
+    id,
+    title,
+    type,
+    databaseId,
+    children,
+  });
+  const databaseNode = (databaseId: string) => node(`outline-${databaseId}`, byId[databaseId]?.name ?? databaseId, "database", [], databaseId);
+  const known = new Set([
+    "clients",
+    "deals",
+    "interactions",
+    "projects",
+    "assets",
+    "tools",
+    "workspace-docs",
+    "agent-teams",
+    "tasks",
+    "workspace-signals",
+  ]);
+  const remainder = databases.filter((database) => !known.has(database.id)).map((database) => databaseNode(database.id));
+  return [
+    node("outline-revenue-os", "Revenue OS", "title", [
+      node("outline-sales-crm", "Sales CRM", "heading", [
+        node("outline-accounts", "Accounts and deals", "subheading", [databaseNode("clients"), databaseNode("deals")]),
+        node("outline-touchpoints", "Touchpoints", "subheading", [databaseNode("interactions")]),
+      ]),
+      node("outline-delivery", "Delivery", "heading", [
+        node("outline-active-work", "Active work", "subheading", [databaseNode("projects"), databaseNode("tasks")]),
+      ]),
+    ]),
+    node("outline-operations-os", "Operations OS", "title", [
+      node("outline-assets-tools", "Assets and tools", "heading", [databaseNode("assets"), databaseNode("tools")]),
+      node("outline-knowledge", "Knowledge", "heading", [databaseNode("workspace-docs"), databaseNode("workspace-signals")]),
+      node("outline-agent-systems", "Agent systems", "heading", [databaseNode("agent-teams")]),
+    ]),
+    node("outline-google-workspace", "Google Workspace", "title", remainder),
+  ];
+}
+
+function normalizeOutline(outline: OutlineNode[], databases: Database[]): OutlineNode[] {
+  const validIds = new Set(databases.map((database) => database.id));
+  const seenDatabaseIds = new Set<string>();
+  const normalize = (nodes: OutlineNode[]): OutlineNode[] => {
+    const next: OutlineNode[] = [];
+    for (const node of nodes) {
+      let current = { ...node, children: normalize(node.children ?? []) };
+      if ((current.title === "sales-tools" || current.databaseId === "crm-sales-tools") && validIds.has("tools")) {
+        current = { ...current, id: "outline-tools", title: "CRM Sales Tools", type: "database", databaseId: "tools", children: [] };
+      }
+      if (!current.databaseId && current.title === "agents" && validIds.has("agent-teams")) {
+        current = { ...current, id: "outline-agent-teams", title: "Agent Teams", type: "database", databaseId: "agent-teams", children: [] };
+      }
+      if (current.databaseId) {
+        if (!validIds.has(current.databaseId) || seenDatabaseIds.has(current.databaseId)) continue;
+        seenDatabaseIds.add(current.databaseId);
+      }
+      next.push(current);
+    }
+    return next;
+  };
+  return normalize(outline);
+}
+
+function databaseIdsInOutline(nodes: OutlineNode[]): Set<string> {
+  const ids = new Set<string>();
+  const walk = (items: OutlineNode[]) => {
+    for (const item of items) {
+      if (item.databaseId) ids.add(item.databaseId);
+      walk(item.children);
+    }
+  };
+  walk(nodes);
+  return ids;
+}
+
+function withLiveOutline(outline: OutlineNode[], liveDatabases: Database[]): OutlineNode[] {
+  const existing = databaseIdsInOutline(outline);
+  const additions = liveDatabases
+    .filter((database) => !existing.has(database.id))
+    .map((database) => ({ id: `outline-${database.id}`, title: database.name, type: "database" as const, databaseId: database.id, children: [] }));
+  if (additions.length === 0) return outline;
+  const googleId = "outline-google-workspace";
+  if (findPath(outline, googleId)) {
+    return updateOutlineNode(outline, googleId, (node) => ({ ...node, children: [...node.children, ...additions] }));
+  }
+  return [...outline, { id: googleId, title: "Google Workspace", type: "title", children: additions }];
+}
+
+function findPath(nodes: OutlineNode[], id: string, prefix: number[] = []): number[] | null {
+  for (let index = 0; index < nodes.length; index += 1) {
+    const path = [...prefix, index];
+    if (nodes[index].id === id) return path;
+    const childPath = findPath(nodes[index].children, id, path);
+    if (childPath) return childPath;
+  }
+  return null;
+}
+
+function getAtPath(nodes: OutlineNode[], path: number[]): OutlineNode | null {
+  let current: OutlineNode | undefined;
+  let level = nodes;
+  for (const index of path) {
+    current = level[index];
+    if (!current) return null;
+    level = current.children;
+  }
+  return current ?? null;
+}
+
+function updateOutlineNode(nodes: OutlineNode[], id: string, updater: (node: OutlineNode) => OutlineNode): OutlineNode[] {
+  return nodes.map((node) => {
+    if (node.id === id) return updater(node);
+    return { ...node, children: updateOutlineNode(node.children, id, updater) };
+  });
+}
+
+function removeAtPath(nodes: OutlineNode[], path: number[]): { nodes: OutlineNode[]; removed: OutlineNode | null } {
+  if (path.length === 0) return { nodes, removed: null };
+  const [index, ...rest] = path;
+  if (rest.length === 0) {
+    return { nodes: nodes.filter((_, itemIndex) => itemIndex !== index), removed: nodes[index] ?? null };
+  }
+  return {
+    nodes: nodes.map((node, itemIndex) => {
+      if (itemIndex !== index) return node;
+      const result = removeAtPath(node.children, rest);
+      return { ...node, children: result.nodes };
+    }),
+    removed: getAtPath(nodes, path),
+  };
+}
+
+function insertAtPath(nodes: OutlineNode[], parentPath: number[], index: number, nodeToInsert: OutlineNode): OutlineNode[] {
+  if (parentPath.length === 0) {
+    const next = [...nodes];
+    next.splice(Math.max(0, Math.min(index, next.length)), 0, nodeToInsert);
+    return next;
+  }
+  const [parentIndex, ...rest] = parentPath;
+  return nodes.map((node, itemIndex) => {
+    if (itemIndex !== parentIndex) return node;
+    return { ...node, children: insertAtPath(node.children, rest, index, nodeToInsert) };
+  });
+}
+
+function moveOutlineNode(nodes: OutlineNode[], id: string, direction: "up" | "down" | "indent" | "outdent"): OutlineNode[] {
+  const path = findPath(nodes, id);
+  if (!path) return nodes;
+  const index = path[path.length - 1];
+  const parentPath = path.slice(0, -1);
+  if (direction === "up" && index > 0) {
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, parentPath, index - 1, result.removed) : nodes;
+  }
+  if (direction === "down") {
+    const parent = parentPath.length ? getAtPath(nodes, parentPath)?.children : nodes;
+    if (!parent || index >= parent.length - 1) return nodes;
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, parentPath, index + 1, result.removed) : nodes;
+  }
+  if (direction === "indent" && index > 0) {
+    const previousSiblingPath = [...parentPath, index - 1];
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, previousSiblingPath, getAtPath(result.nodes, previousSiblingPath)?.children.length ?? 0, result.removed) : nodes;
+  }
+  if (direction === "outdent" && parentPath.length > 0) {
+    const parentIndex = parentPath[parentPath.length - 1];
+    const grandParentPath = parentPath.slice(0, -1);
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, grandParentPath, parentIndex + 1, result.removed) : nodes;
+  }
+  return nodes;
+}
+
+function dropOutlineNode(nodes: OutlineNode[], draggedId: string, targetId: string, mode: "before" | "inside"): OutlineNode[] {
+  if (draggedId === targetId) return nodes;
+  const dragPath = findPath(nodes, draggedId);
+  const targetPath = findPath(nodes, targetId);
+  if (!dragPath || !targetPath) return nodes;
+  if (targetPath.join(".").startsWith(`${dragPath.join(".")}.`)) return nodes;
+  const result = removeAtPath(nodes, dragPath);
+  if (!result.removed) return nodes;
+  const nextTargetPath = findPath(result.nodes, targetId);
+  if (!nextTargetPath) return nodes;
+  if (mode === "inside") {
+    return insertAtPath(result.nodes, nextTargetPath, getAtPath(result.nodes, nextTargetPath)?.children.length ?? 0, result.removed);
+  }
+  return insertAtPath(result.nodes, nextTargetPath.slice(0, -1), nextTargetPath[nextTargetPath.length - 1], result.removed);
 }
 
 function sourceLabel(source: SourceType) {
@@ -301,6 +508,8 @@ function todayIso() {
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(loadWorkspace);
   const [activeDbId, setActiveDbId] = useState(workspace.databases[0]?.id ?? "clients");
+  const [activeOutlineId, setActiveOutlineId] = useState(workspace.outline[0]?.id ?? "");
+  const [mode, setMode] = useState<"structure" | "database">("structure");
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [showBuilder, setShowBuilder] = useState(true);
@@ -308,6 +517,7 @@ export default function App() {
   const [liveStatus, setLiveStatus] = useState<"loading" | "connected" | "error">("loading");
 
   const activeDb = workspace.databases.find((database) => database.id === activeDbId) ?? workspace.databases[0];
+  const activeOutline = findPath(workspace.outline, activeOutlineId) ? getAtPath(workspace.outline, findPath(workspace.outline, activeOutlineId) ?? []) : workspace.outline[0];
   const [viewByDb, setViewByDb] = useState<Record<string, string>>(
     Object.fromEntries(workspace.databases.map((database) => [database.id, database.views[0]?.id ?? ""])),
   );
@@ -337,13 +547,62 @@ export default function App() {
     saveWorkspace(next);
   };
 
+  const updateOutline = (outline: OutlineNode[]) => {
+    updateWorkspace({ ...workspace, outline });
+  };
+
+  const renameOutlineNode = (id: string, title: string) => {
+    updateOutline(updateOutlineNode(workspace.outline, id, (node) => ({ ...node, title })));
+  };
+
+  const addOutlineChild = (parentId: string, type: OutlineNodeType = "theme") => {
+    const child: OutlineNode = {
+      id: makeId("outline"),
+      title: type === "database" ? "New database" : `New ${type}`,
+      type,
+      children: [],
+    };
+    updateOutline(updateOutlineNode(workspace.outline, parentId, (node) => ({ ...node, children: [...node.children, child] })));
+    setActiveOutlineId(child.id);
+    setMode("structure");
+  };
+
+  const addOutlineTitle = () => {
+    const title: OutlineNode = {
+      id: makeId("outline"),
+      title: "New title",
+      type: "title",
+      children: [],
+    };
+    updateOutline([...workspace.outline, title]);
+    setActiveOutlineId(title.id);
+    setMode("structure");
+  };
+
+  const moveOutline = (id: string, direction: "up" | "down" | "indent" | "outdent") => {
+    updateOutline(moveOutlineNode(workspace.outline, id, direction));
+  };
+
+  const dropOutline = (draggedId: string, targetId: string, dropMode: "before" | "inside") => {
+    updateOutline(dropOutlineNode(workspace.outline, draggedId, targetId, dropMode));
+  };
+
+  const renameDatabase = (name: string) => {
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) => (database.id === activeDb.id ? { ...database, name } : database)),
+      outline: updateOutlineNode(workspace.outline, `outline-${activeDb.id}`, (node) => ({ ...node, title: name })),
+    });
+  };
+
   useEffect(() => {
     let cancelled = false;
     fetchLiveDatabases(workspace.apiBase)
       .then((liveDatabases) => {
         if (cancelled || liveDatabases.length === 0) return;
         setWorkspace((current) => {
-          const next = { ...current, databases: mergeLiveDatabases(current.databases, liveDatabases) };
+          const nextDatabases = mergeLiveDatabases(current.databases, liveDatabases);
+          const next = { ...current, databases: nextDatabases, outline: withLiveOutline(current.outline, liveDatabases) };
           saveWorkspace(next);
           return next;
         });
@@ -501,6 +760,8 @@ export default function App() {
     const next = seedState();
     updateWorkspace(next);
     setActiveDbId(next.databases[0].id);
+    setActiveOutlineId(next.outline[0]?.id ?? "");
+    setMode("structure");
     setSelectedRecordId(null);
     setViewByDb(Object.fromEntries(next.databases.map((database) => [database.id, database.views[0]?.id ?? ""])));
   };
@@ -557,70 +818,109 @@ export default function App() {
     <div className="app-shell">
       <Sidebar
         databases={workspace.databases}
+        outline={workspace.outline}
         connections={sourceConnections}
+        activeOutlineId={activeOutlineId}
         activeDbId={activeDb.id}
-        onSelect={(id) => {
-          setActiveDbId(id);
+        onSelectOutline={(id) => {
+          setActiveOutlineId(id);
+          setMode("structure");
           setSelectedRecordId(null);
         }}
+        onSelectDatabase={(id) => {
+          setActiveDbId(id);
+          setMode("database");
+          setSelectedRecordId(null);
+        }}
+        onRename={renameOutlineNode}
+        onMove={moveOutline}
+        onDrop={dropOutline}
       />
       <main className="workspace">
-        <Header
-          database={activeDb}
-          view={activeView}
-          records={records}
-          query={query}
-          setQuery={setQuery}
-          onAdd={addRecord}
-          onExport={exportJson}
-          onReset={resetWorkspace}
-          onSync={syncNow}
-          showBuilder={showBuilder}
-          setShowBuilder={setShowBuilder}
-          apiBase={workspace.apiBase}
-          setApiBase={(apiBase) => updateWorkspace({ ...workspace, apiBase })}
-        />
-        <Dashboard databases={workspace.databases} outbox={workspace.outbox} conflicts={workspace.conflicts} activeDb={activeDb} />
-        <SourceDock connections={sourceConnections} activeSource={activeDb.sync.sourceType} />
-        {globalResults.length > 0 && (
-          <GlobalResults
-            results={globalResults}
-            onOpen={(databaseId, recordId) => {
+        {mode === "structure" ? (
+          <StructureWorkspace
+            outline={workspace.outline}
+            activeOutline={activeOutline}
+            databases={workspace.databases}
+            query={query}
+            setQuery={setQuery}
+            liveStatus={liveStatus}
+            apiBase={workspace.apiBase}
+            setApiBase={(apiBase) => updateWorkspace({ ...workspace, apiBase })}
+            onAddTitle={addOutlineTitle}
+            onAddChild={addOutlineChild}
+            onRename={renameOutlineNode}
+            onMove={moveOutline}
+            onDrop={dropOutline}
+            onOpenDatabase={(databaseId) => {
               setActiveDbId(databaseId);
-              setSelectedRecordId(recordId);
+              setMode("database");
+              setSelectedRecordId(null);
             }}
+            onExport={exportJson}
+            onReset={resetWorkspace}
+            onSync={syncNow}
           />
-        )}
-        <ViewTabs
-          views={activeDb.views}
-          activeViewId={activeView.id}
-          onSelect={(id) => setViewByDb({ ...viewByDb, [activeDb.id]: id })}
-          onAddView={addView}
-        />
-        <section className={`content-grid ${showBuilder ? "with-builder" : ""}`}>
-          <div className="database-surface">
-            <DatabaseRenderer
+        ) : (
+          <>
+            <Header
               database={activeDb}
               view={activeView}
               records={records}
-              onOpen={setSelectedRecordId}
-              onUpdate={updateRecord}
+              query={query}
+              setQuery={setQuery}
+              onAdd={addRecord}
+              onExport={exportJson}
+              onReset={resetWorkspace}
+              onSync={syncNow}
+              showBuilder={showBuilder}
+              setShowBuilder={setShowBuilder}
+              apiBase={workspace.apiBase}
+              setApiBase={(apiBase) => updateWorkspace({ ...workspace, apiBase })}
+              onRenameDatabase={renameDatabase}
             />
-          </div>
-          {showBuilder && (
-            <RightPanel
-              activePanel={activePanel}
-              setActivePanel={setActivePanel}
-              database={activeDb}
-              view={activeView}
-              onUpdateView={updateView}
-              connections={sourceConnections}
-              outbox={workspace.outbox}
-              conflicts={workspace.conflicts}
-              syncRuns={workspace.syncRuns}
+            <Dashboard databases={workspace.databases} outbox={workspace.outbox} conflicts={workspace.conflicts} activeDb={activeDb} />
+            {globalResults.length > 0 && (
+              <GlobalResults
+                results={globalResults}
+                onOpen={(databaseId, recordId) => {
+                  setActiveDbId(databaseId);
+                  setSelectedRecordId(recordId);
+                }}
+              />
+            )}
+            <ViewTabs
+              views={activeDb.views}
+              activeViewId={activeView.id}
+              onSelect={(id) => setViewByDb({ ...viewByDb, [activeDb.id]: id })}
+              onAddView={addView}
             />
-          )}
-        </section>
+            <section className={`content-grid ${showBuilder ? "with-builder" : ""}`}>
+              <div className="database-surface">
+                <DatabaseRenderer
+                  database={activeDb}
+                  view={activeView}
+                  records={records}
+                  onOpen={setSelectedRecordId}
+                  onUpdate={updateRecord}
+                />
+              </div>
+              {showBuilder && (
+                <RightPanel
+                  activePanel={activePanel}
+                  setActivePanel={setActivePanel}
+                  database={activeDb}
+                  view={activeView}
+                  onUpdateView={updateView}
+                  connections={sourceConnections}
+                  outbox={workspace.outbox}
+                  conflicts={workspace.conflicts}
+                  syncRuns={workspace.syncRuns}
+                />
+              )}
+            </section>
+          </>
+        )}
       </main>
       {selectedRecord && (
         <RecordDrawer
@@ -638,16 +938,27 @@ export default function App() {
 
 function Sidebar({
   databases,
+  outline,
   connections,
+  activeOutlineId,
   activeDbId,
-  onSelect,
+  onSelectOutline,
+  onSelectDatabase,
+  onRename,
+  onMove,
+  onDrop,
 }: {
   databases: Database[];
+  outline: OutlineNode[];
   connections: SourceConnection[];
+  activeOutlineId: string;
   activeDbId: string;
-  onSelect: (id: string) => void;
+  onSelectOutline: (id: string) => void;
+  onSelectDatabase: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
 }) {
-  const categories = Array.from(new Set(databases.map((database) => database.category)));
   const totalRecords = databases.reduce((sum, database) => sum + database.records.length, 0);
   return (
     <aside className="sidebar">
@@ -661,27 +972,301 @@ function Sidebar({
       <div className="side-search-card">
         <span>Source state</span>
         <strong>{connections.filter((connection) => connection.state === "snapshot" || connection.state === "connected").length} connected snapshots</strong>
-        <small>Cloudflare and GitHub are staged for auth.</small>
+        <small>Rename, move, indent, and drag the structure.</small>
       </div>
       <nav className="nav-groups">
-        {categories.map((category) => (
-          <div className="nav-group" key={category}>
-            <p>{category}</p>
-            {databases
-              .filter((database) => database.category === category)
-              .map((database) => (
-                <button className={database.id === activeDbId ? "active" : ""} key={database.id} onClick={() => onSelect(database.id)}>
-                  <span>
-                    <b>{database.shortName}</b>
-                    <small>{sourceLabel(database.sync.sourceType)}</small>
-                  </span>
-                  <em>{database.records.length}</em>
-                </button>
-              ))}
-          </div>
+        {outline.map((node) => (
+          <OutlineTreeItem
+            key={node.id}
+            node={node}
+            level={0}
+            databases={databases}
+            activeOutlineId={activeOutlineId}
+            activeDbId={activeDbId}
+            onSelectOutline={onSelectOutline}
+            onSelectDatabase={onSelectDatabase}
+            onRename={onRename}
+            onMove={onMove}
+            onDrop={onDrop}
+          />
         ))}
       </nav>
     </aside>
+  );
+}
+
+function OutlineTreeItem({
+  node,
+  level,
+  databases,
+  activeOutlineId,
+  activeDbId,
+  onSelectOutline,
+  onSelectDatabase,
+  onRename,
+  onMove,
+  onDrop,
+}: {
+  node: OutlineNode;
+  level: number;
+  databases: Database[];
+  activeOutlineId: string;
+  activeDbId: string;
+  onSelectOutline: (id: string) => void;
+  onSelectDatabase: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+}) {
+  const database = node.databaseId ? databases.find((item) => item.id === node.databaseId) : null;
+  const isActive = node.databaseId ? node.databaseId === activeDbId : node.id === activeOutlineId;
+  const select = () => {
+    if (node.databaseId) onSelectDatabase(node.databaseId);
+    else onSelectOutline(node.id);
+  };
+  return (
+    <div
+      className={`outline-tree-item level-${Math.min(level, 4)}`}
+      draggable
+      onDragStart={(event) => event.dataTransfer.setData("text/plain", node.id)}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        const draggedId = event.dataTransfer.getData("text/plain");
+        if (draggedId) onDrop(draggedId, node.id, event.altKey ? "inside" : "before");
+      }}
+    >
+      <div className={`outline-row ${isActive ? "active" : ""}`}>
+        <button className="outline-open" onClick={select}>
+          <span>{node.type}</span>
+          <strong>{database?.shortName ?? node.title.slice(0, 2).toUpperCase()}</strong>
+        </button>
+        <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
+        {database && <em>{database.records.length}</em>}
+        <div className="move-controls">
+          <button title="Move up" onClick={() => onMove(node.id, "up")}>Up</button>
+          <button title="Move down" onClick={() => onMove(node.id, "down")}>Down</button>
+          <button title="Indent" onClick={() => onMove(node.id, "indent")}>In</button>
+          <button title="Outdent" onClick={() => onMove(node.id, "outdent")}>Out</button>
+        </div>
+      </div>
+      {node.children.length > 0 && (
+        <div className="outline-children">
+          {node.children.map((child) => (
+            <OutlineTreeItem
+              key={child.id}
+              node={child}
+              level={level + 1}
+              databases={databases}
+              activeOutlineId={activeOutlineId}
+              activeDbId={activeDbId}
+              onSelectOutline={onSelectOutline}
+              onSelectDatabase={onSelectDatabase}
+              onRename={onRename}
+              onMove={onMove}
+              onDrop={onDrop}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StructureWorkspace({
+  outline,
+  activeOutline,
+  databases,
+  query,
+  setQuery,
+  liveStatus,
+  apiBase,
+  setApiBase,
+  onAddChild,
+  onAddTitle,
+  onRename,
+  onMove,
+  onDrop,
+  onOpenDatabase,
+  onExport,
+  onReset,
+  onSync,
+}: {
+  outline: OutlineNode[];
+  activeOutline: OutlineNode | null;
+  databases: Database[];
+  query: string;
+  setQuery: (value: string) => void;
+  liveStatus: "loading" | "connected" | "error";
+  apiBase: string;
+  setApiBase: (value: string) => void;
+  onAddChild: (parentId: string, type?: OutlineNodeType) => void;
+  onAddTitle: () => void;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onOpenDatabase: (databaseId: string) => void;
+  onExport: () => void;
+  onReset: () => void;
+  onSync: () => void;
+}) {
+  const totalRecords = databases.reduce((sum, database) => sum + database.records.length, 0);
+  const selected = activeOutline ?? outline[0] ?? null;
+  return (
+    <section className="structure-workspace">
+      <header className="structure-header">
+        <div>
+          <p className="eyebrow">Workspace structure</p>
+          <input
+            className="editable-title"
+            value={selected?.title ?? "Workspace"}
+            onChange={(event) => selected && onRename(selected.id, event.target.value)}
+            aria-label="Rename selected structure item"
+          />
+          <p className="subtle">Build this like a note outline: titles, headings, subheadings, themes, data, and raw source references.</p>
+        </div>
+        <div className="structure-actions">
+          <label className="command-search">
+            <span>Search workspace</span>
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${totalRecords} records`} />
+          </label>
+          <label className="api-field">
+            <span>Sync API</span>
+            <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
+          </label>
+          <div className="action-row">
+            <button className="secondary" onClick={onAddTitle}>Add title</button>
+            <button className="secondary" onClick={onExport}>Export</button>
+            <button className="secondary" onClick={onReset}>Reset mirror</button>
+            <button className="secondary" onClick={onSync}>Sync now</button>
+          </div>
+        </div>
+      </header>
+      <div className="structure-status">
+        <span className={`status-dot ${liveStatus === "connected" ? "connected" : liveStatus === "loading" ? "syncing" : "error"}`} />
+        <strong>{totalRecords} records</strong>
+        <span>{databases.length} databases nested inside your structure</span>
+        <span>{liveStatus === "connected" ? "Live Google Workspace mirror loaded" : liveStatus === "loading" ? "Loading live mirror" : "Live mirror unavailable; local cache active"}</span>
+      </div>
+      {selected && (
+        <div className="structure-toolbar">
+          <span>Selected: {selected.type}</span>
+          <button onClick={() => onAddChild(selected.id, "heading")}>Add heading</button>
+          <button onClick={() => onAddChild(selected.id, "subheading")}>Add subheading</button>
+          <button onClick={() => onAddChild(selected.id, "theme")}>Add theme</button>
+          <button onClick={() => onMove(selected.id, "up")}>Move up</button>
+          <button onClick={() => onMove(selected.id, "down")}>Move down</button>
+          <button onClick={() => onMove(selected.id, "indent")}>Indent</button>
+          <button onClick={() => onMove(selected.id, "outdent")}>Outdent</button>
+        </div>
+      )}
+      <div className="outline-canvas">
+        {outline.map((node) => (
+          <OutlineCanvasNode
+            key={node.id}
+            node={node}
+            level={0}
+            databases={databases}
+            query={query}
+            onRename={onRename}
+            onMove={onMove}
+            onDrop={onDrop}
+            onAddChild={onAddChild}
+            onOpenDatabase={onOpenDatabase}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OutlineCanvasNode({
+  node,
+  level,
+  databases,
+  query,
+  onRename,
+  onMove,
+  onDrop,
+  onAddChild,
+  onOpenDatabase,
+}: {
+  node: OutlineNode;
+  level: number;
+  databases: Database[];
+  query: string;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onAddChild: (parentId: string, type?: OutlineNodeType) => void;
+  onOpenDatabase: (databaseId: string) => void;
+}) {
+  const database = node.databaseId ? databases.find((item) => item.id === node.databaseId) : null;
+  const matchingRecords = database?.records.filter((record) => matchesSearch(database, record, query)).slice(0, 4) ?? [];
+  const titleField = database ? getTitleField(database) : null;
+  return (
+    <article
+      className={`canvas-node ${node.type} level-${Math.min(level, 5)}`}
+      draggable
+      onDragStart={(event) => event.dataTransfer.setData("text/plain", node.id)}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        const draggedId = event.dataTransfer.getData("text/plain");
+        if (draggedId) onDrop(draggedId, node.id, event.altKey ? "inside" : "before");
+      }}
+    >
+      <div className="canvas-line">
+        <span className="outline-bullet" />
+        <span className="node-type">{node.type}</span>
+        <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
+        {database && <button className="button-link" onClick={() => onOpenDatabase(database.id)}>Open database</button>}
+        <div className="move-controls">
+          <button onClick={() => onMove(node.id, "up")}>Up</button>
+          <button onClick={() => onMove(node.id, "down")}>Down</button>
+          <button onClick={() => onMove(node.id, "indent")}>In</button>
+          <button onClick={() => onMove(node.id, "outdent")}>Out</button>
+        </div>
+      </div>
+      {database && (
+        <div className="data-preview">
+          <div>
+            <strong>{database.records.length} data points</strong>
+            <span>{database.source}</span>
+          </div>
+          {matchingRecords.map((record) => (
+            <button key={record.id} onClick={() => onOpenDatabase(database.id)}>
+              <span>{valueText(record[titleField?.key ?? ""]) || "Untitled"}</span>
+              <small>{record._source?.url ? "reference/source/raw data attached" : "mirrored source record"}</small>
+            </button>
+          ))}
+        </div>
+      )}
+      {!database && (
+        <div className="node-add-row">
+          <button onClick={() => onAddChild(node.id, "theme")}>Add theme</button>
+          <button onClick={() => onAddChild(node.id, "subheading")}>Add subheading</button>
+        </div>
+      )}
+      {node.children.length > 0 && (
+        <div className="canvas-children">
+          {node.children.map((child) => (
+            <OutlineCanvasNode
+              key={child.id}
+              node={child}
+              level={level + 1}
+              databases={databases}
+              query={query}
+              onRename={onRename}
+              onMove={onMove}
+              onDrop={onDrop}
+              onAddChild={onAddChild}
+              onOpenDatabase={onOpenDatabase}
+            />
+          ))}
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -699,6 +1284,7 @@ function Header({
   setShowBuilder,
   apiBase,
   setApiBase,
+  onRenameDatabase,
 }: {
   database: Database;
   view: DatabaseView;
@@ -713,12 +1299,13 @@ function Header({
   setShowBuilder: (value: boolean) => void;
   apiBase: string;
   setApiBase: (value: string) => void;
+  onRenameDatabase: (value: string) => void;
 }) {
   return (
     <header className="topbar">
       <div className="title-block">
         <p className="eyebrow">{database.category} / {sourceLabel(database.sync.sourceType)}</p>
-        <h1>{database.name}</h1>
+        <input className="editable-title" value={database.name} onChange={(event) => onRenameDatabase(event.target.value)} aria-label="Rename database" />
         <p className="subtle">{database.description}</p>
         <div className="source-line">
           <span className={`status-dot ${database.sync.state}`} />
