@@ -29,9 +29,12 @@
       "id": "7963dd4ce8114a6c83b15231fb1ec56a"
     }
   ],
-  // R2 is intentionally held until R2 is enabled for this Cloudflare account.
-  // The planned binding is:
-  // "r2_buckets": [{ "binding": "ARTIFACTS", "bucket_name": "mab-database-os-artifacts" }]
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "mab-database-os-artifacts"
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
