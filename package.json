@@ -1,0 +1,31 @@
+{
+  "name": "personal-database-os",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "worker:dev": "wrangler dev --config worker/wrangler.jsonc",
+    "worker:check": "npx tsc -p worker/tsconfig.json --noEmit",
+    "worker:types": "wrangler types worker/src/worker-configuration.d.ts --config worker/wrangler.jsonc",
+    "worker:deploy": "wrangler deploy --config worker/wrangler.jsonc",
+    "deploy": "npm run build && wrangler deploy --config worker/wrangler.jsonc"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.10"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.32.2",
+    "@playwright/test": "^1.59.1",
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "wrangler": "^4.82.2"
+  }
+}

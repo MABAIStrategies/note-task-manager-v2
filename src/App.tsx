@@ -1,0 +1,2059 @@
+import { useEffect, useMemo, useState } from "react";
+import { initialConflicts, initialOutbox, initialSyncRuns, mabDatabases, sourceConnections } from "./data";
+import type {
+  ConflictItem,
+  Database,
+  DatabaseView,
+  Field,
+  OutboxOperation,
+  RecordItem,
+  RecordValue,
+  SourceConnection,
+  SourceType,
+  SyncRun,
+  ViewType,
+} from "./types";
+
+const storageKey = "mab-database-os:v2";
+const defaultApiBase =
+  ((import.meta as ImportMeta & { env?: Record<string, string> }).env?.VITE_SYNC_API_BASE as string | undefined) ??
+  "https://mab-database-os-worker.mark-fc2.workers.dev";
+
+interface WorkspaceState {
+  databases: Database[];
+  outline: OutlineNode[];
+  outbox: OutboxOperation[];
+  conflicts: ConflictItem[];
+  syncRuns: SyncRun[];
+  apiBase: string;
+}
+
+type OutlineNodeType = "title" | "heading" | "subheading" | "theme" | "text" | "todo" | "divider" | "database";
+
+interface OutlineNode {
+  id: string;
+  title: string;
+  type: OutlineNodeType;
+  databaseId?: string;
+  checked?: boolean;
+  children: OutlineNode[];
+}
+
+interface ApiEnvelope<T> {
+  ok: boolean;
+  data: T;
+}
+
+interface ApiCollection {
+  id: string;
+  sourceId: string;
+  externalId: string | null;
+  name: string;
+  kind: string;
+  schema: Record<string, { type?: string }>;
+  views: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  lastSyncedAt: string | null;
+}
+
+interface ApiRecord {
+  id: string;
+  sourceId: string;
+  collectionId: string;
+  externalId: string | null;
+  title: string;
+  status: string;
+  url: string | null;
+  properties: Record<string, unknown>;
+  content: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  archived: boolean;
+  lastSyncedAt: string | null;
+}
+
+function seedState(): WorkspaceState {
+  return {
+    databases: mabDatabases,
+    outline: defaultOutline(mabDatabases),
+    outbox: initialOutbox,
+    conflicts: initialConflicts,
+    syncRuns: initialSyncRuns,
+    apiBase: defaultApiBase,
+  };
+}
+
+function loadWorkspace(): WorkspaceState {
+  try {
+    const stored = window.localStorage.getItem(storageKey);
+    if (!stored) return seedState();
+    const parsed = JSON.parse(stored) as Partial<WorkspaceState>;
+    if (!Array.isArray(parsed.databases)) return seedState();
+    const parsedOutline = Array.isArray(parsed.outline) ? parsed.outline : defaultOutline(parsed.databases);
+    return {
+      databases: parsed.databases,
+      outline: normalizeOutline(parsedOutline, parsed.databases),
+      outbox: parsed.outbox ?? initialOutbox,
+      conflicts: parsed.conflicts ?? initialConflicts,
+      syncRuns: parsed.syncRuns ?? initialSyncRuns,
+      apiBase: parsed.apiBase ?? defaultApiBase,
+    };
+  } catch {
+    return seedState();
+  }
+}
+
+function saveWorkspace(state: WorkspaceState) {
+  window.localStorage.setItem(storageKey, JSON.stringify(state));
+}
+
+function recordValue(value: RecordItem[string]): RecordValue {
+  if (value && typeof value === "object" && !Array.isArray(value)) return undefined;
+  return value as RecordValue;
+}
+
+function formatCurrency(value: RecordItem[string]) {
+  const number = typeof value === "number" ? value : Number(recordValue(value) || 0);
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(number);
+}
+
+function formatDate(value: RecordItem[string]) {
+  const resolved = recordValue(value);
+  if (!resolved || Array.isArray(resolved) || typeof resolved === "boolean") return "";
+  const date = new Date(resolved);
+  if (Number.isNaN(date.getTime())) return String(resolved);
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(date);
+}
+
+function valueText(value: RecordItem[string]) {
+  const resolved = recordValue(value);
+  if (Array.isArray(resolved)) return resolved.join(", ");
+  if (typeof resolved === "boolean") return resolved ? "Yes" : "No";
+  if (resolved === undefined) return "";
+  return String(resolved);
+}
+
+function getTitleField(database: Database) {
+  return database.fields.find((field) => field.type === "title") ?? database.fields[0];
+}
+
+function getDateField(database: Database, view?: DatabaseView) {
+  const viewDate = view?.sortBy ? database.fields.find((field) => field.key === view.sortBy && (field.type === "date" || field.type === "datetime")) : undefined;
+  return viewDate ?? database.fields.find((field) => field.type === "date" || field.type === "datetime");
+}
+
+function getField(database: Database, key: string) {
+  return database.fields.find((field) => field.key === key);
+}
+
+function classForOption(field: Field | undefined, value: string) {
+  const color = field?.options?.find((option) => option.name === value)?.color ?? "plain";
+  return `pill ${color}`;
+}
+
+function matchesSearch(database: Database, record: RecordItem, query: string) {
+  if (!query.trim()) return true;
+  const haystack = [
+    database.name,
+    database.category,
+    database.source,
+    record._summary,
+    ...database.fields.map((field) => valueText(record[field.key])),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query.toLowerCase());
+}
+
+function makeId(prefix: string) {
+  return `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function outlineTypeLabel(type: OutlineNodeType) {
+  return {
+    title: "page",
+    heading: "heading",
+    subheading: "subheading",
+    theme: "theme",
+    text: "text",
+    todo: "to-do",
+    divider: "divider",
+    database: "database",
+  }[type];
+}
+
+function newOutlineNode(type: OutlineNodeType, title?: string, databaseId?: string): OutlineNode {
+  return {
+    id: makeId("outline"),
+    title:
+      title ??
+      {
+        title: "Untitled",
+        heading: "Heading",
+        subheading: "Subheading",
+        theme: "Theme",
+        text: "Write something...",
+        todo: "To-do",
+        divider: "",
+        database: "New database",
+      }[type],
+    type,
+    databaseId,
+    checked: type === "todo" ? false : undefined,
+    children: [],
+  };
+}
+
+function cloneOutlineNode(node: OutlineNode): OutlineNode {
+  return {
+    ...node,
+    id: makeId("outline"),
+    children: node.children.map(cloneOutlineNode),
+  };
+}
+
+function defaultOutline(databases: Database[]): OutlineNode[] {
+  const byId = Object.fromEntries(databases.map((database) => [database.id, database]));
+  const node = (id: string, title: string, type: OutlineNodeType, children: OutlineNode[] = [], databaseId?: string): OutlineNode => ({
+    id,
+    title,
+    type,
+    databaseId,
+    children,
+  });
+  const databaseNode = (databaseId: string) => node(`outline-${databaseId}`, byId[databaseId]?.name ?? databaseId, "database", [], databaseId);
+  const known = new Set([
+    "clients",
+    "deals",
+    "interactions",
+    "projects",
+    "assets",
+    "tools",
+    "workspace-docs",
+    "agent-teams",
+    "tasks",
+    "workspace-signals",
+  ]);
+  const remainder = databases.filter((database) => !known.has(database.id)).map((database) => databaseNode(database.id));
+  return [
+    node("outline-revenue-os", "Revenue OS", "title", [
+      node("outline-sales-crm", "Sales CRM", "heading", [
+        node("outline-accounts", "Accounts and deals", "subheading", [databaseNode("clients"), databaseNode("deals")]),
+        node("outline-touchpoints", "Touchpoints", "subheading", [databaseNode("interactions")]),
+      ]),
+      node("outline-delivery", "Delivery", "heading", [
+        node("outline-active-work", "Active work", "subheading", [databaseNode("projects"), databaseNode("tasks")]),
+      ]),
+    ]),
+    node("outline-operations-os", "Operations OS", "title", [
+      node("outline-assets-tools", "Assets and tools", "heading", [databaseNode("assets"), databaseNode("tools")]),
+      node("outline-knowledge", "Knowledge", "heading", [databaseNode("workspace-docs"), databaseNode("workspace-signals")]),
+      node("outline-agent-systems", "Agent systems", "heading", [databaseNode("agent-teams")]),
+    ]),
+    node("outline-google-workspace", "Google Workspace", "title", remainder),
+  ];
+}
+
+function normalizeOutline(outline: OutlineNode[], databases: Database[]): OutlineNode[] {
+  const validIds = new Set(databases.map((database) => database.id));
+  const seenDatabaseIds = new Set<string>();
+  const normalize = (nodes: OutlineNode[]): OutlineNode[] => {
+    const next: OutlineNode[] = [];
+    for (const node of nodes) {
+      let current = { ...node, children: normalize(node.children ?? []) };
+      if ((current.title === "sales-tools" || current.databaseId === "crm-sales-tools") && validIds.has("tools")) {
+        current = { ...current, id: "outline-tools", title: "CRM Sales Tools", type: "database", databaseId: "tools", children: [] };
+      }
+      if (!current.databaseId && current.title === "agents" && validIds.has("agent-teams")) {
+        current = { ...current, id: "outline-agent-teams", title: "Agent Teams", type: "database", databaseId: "agent-teams", children: [] };
+      }
+      if (current.databaseId) {
+        if (!validIds.has(current.databaseId) || seenDatabaseIds.has(current.databaseId)) continue;
+        seenDatabaseIds.add(current.databaseId);
+      }
+      next.push(current);
+    }
+    return next;
+  };
+  return normalize(outline);
+}
+
+function databaseIdsInOutline(nodes: OutlineNode[]): Set<string> {
+  const ids = new Set<string>();
+  const walk = (items: OutlineNode[]) => {
+    for (const item of items) {
+      if (item.databaseId) ids.add(item.databaseId);
+      walk(item.children);
+    }
+  };
+  walk(nodes);
+  return ids;
+}
+
+function withLiveOutline(outline: OutlineNode[], liveDatabases: Database[]): OutlineNode[] {
+  const existing = databaseIdsInOutline(outline);
+  const additions = liveDatabases
+    .filter((database) => !existing.has(database.id))
+    .map((database) => ({ id: `outline-${database.id}`, title: database.name, type: "database" as const, databaseId: database.id, children: [] }));
+  if (additions.length === 0) return outline;
+  const googleId = "outline-google-workspace";
+  if (findPath(outline, googleId)) {
+    return updateOutlineNode(outline, googleId, (node) => ({ ...node, children: [...node.children, ...additions] }));
+  }
+  return [...outline, { id: googleId, title: "Google Workspace", type: "title", children: additions }];
+}
+
+function findPath(nodes: OutlineNode[], id: string, prefix: number[] = []): number[] | null {
+  for (let index = 0; index < nodes.length; index += 1) {
+    const path = [...prefix, index];
+    if (nodes[index].id === id) return path;
+    const childPath = findPath(nodes[index].children, id, path);
+    if (childPath) return childPath;
+  }
+  return null;
+}
+
+function getAtPath(nodes: OutlineNode[], path: number[]): OutlineNode | null {
+  let current: OutlineNode | undefined;
+  let level = nodes;
+  for (const index of path) {
+    current = level[index];
+    if (!current) return null;
+    level = current.children;
+  }
+  return current ?? null;
+}
+
+function updateOutlineNode(nodes: OutlineNode[], id: string, updater: (node: OutlineNode) => OutlineNode): OutlineNode[] {
+  return nodes.map((node) => {
+    if (node.id === id) return updater(node);
+    return { ...node, children: updateOutlineNode(node.children, id, updater) };
+  });
+}
+
+function removeAtPath(nodes: OutlineNode[], path: number[]): { nodes: OutlineNode[]; removed: OutlineNode | null } {
+  if (path.length === 0) return { nodes, removed: null };
+  const [index, ...rest] = path;
+  if (rest.length === 0) {
+    return { nodes: nodes.filter((_, itemIndex) => itemIndex !== index), removed: nodes[index] ?? null };
+  }
+  return {
+    nodes: nodes.map((node, itemIndex) => {
+      if (itemIndex !== index) return node;
+      const result = removeAtPath(node.children, rest);
+      return { ...node, children: result.nodes };
+    }),
+    removed: getAtPath(nodes, path),
+  };
+}
+
+function insertAtPath(nodes: OutlineNode[], parentPath: number[], index: number, nodeToInsert: OutlineNode): OutlineNode[] {
+  if (parentPath.length === 0) {
+    const next = [...nodes];
+    next.splice(Math.max(0, Math.min(index, next.length)), 0, nodeToInsert);
+    return next;
+  }
+  const [parentIndex, ...rest] = parentPath;
+  return nodes.map((node, itemIndex) => {
+    if (itemIndex !== parentIndex) return node;
+    return { ...node, children: insertAtPath(node.children, rest, index, nodeToInsert) };
+  });
+}
+
+function duplicateOutlineNode(nodes: OutlineNode[], id: string): OutlineNode[] {
+  const path = findPath(nodes, id);
+  if (!path) return nodes;
+  const node = getAtPath(nodes, path);
+  if (!node) return nodes;
+  return insertAtPath(nodes, path.slice(0, -1), path[path.length - 1] + 1, cloneOutlineNode(node));
+}
+
+function deleteOutlineNode(nodes: OutlineNode[], id: string): OutlineNode[] {
+  const path = findPath(nodes, id);
+  if (!path) return nodes;
+  const result = removeAtPath(nodes, path);
+  return result.removed ? result.nodes : nodes;
+}
+
+function moveOutlineNode(nodes: OutlineNode[], id: string, direction: "up" | "down" | "indent" | "outdent"): OutlineNode[] {
+  const path = findPath(nodes, id);
+  if (!path) return nodes;
+  const index = path[path.length - 1];
+  const parentPath = path.slice(0, -1);
+  if (direction === "up" && index > 0) {
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, parentPath, index - 1, result.removed) : nodes;
+  }
+  if (direction === "down") {
+    const parent = parentPath.length ? getAtPath(nodes, parentPath)?.children : nodes;
+    if (!parent || index >= parent.length - 1) return nodes;
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, parentPath, index + 1, result.removed) : nodes;
+  }
+  if (direction === "indent" && index > 0) {
+    const previousSiblingPath = [...parentPath, index - 1];
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, previousSiblingPath, getAtPath(result.nodes, previousSiblingPath)?.children.length ?? 0, result.removed) : nodes;
+  }
+  if (direction === "outdent" && parentPath.length > 0) {
+    const parentIndex = parentPath[parentPath.length - 1];
+    const grandParentPath = parentPath.slice(0, -1);
+    const result = removeAtPath(nodes, path);
+    return result.removed ? insertAtPath(result.nodes, grandParentPath, parentIndex + 1, result.removed) : nodes;
+  }
+  return nodes;
+}
+
+function dropOutlineNode(nodes: OutlineNode[], draggedId: string, targetId: string, mode: "before" | "inside"): OutlineNode[] {
+  if (draggedId === targetId) return nodes;
+  const dragPath = findPath(nodes, draggedId);
+  const targetPath = findPath(nodes, targetId);
+  if (!dragPath || !targetPath) return nodes;
+  if (targetPath.join(".").startsWith(`${dragPath.join(".")}.`)) return nodes;
+  const result = removeAtPath(nodes, dragPath);
+  if (!result.removed) return nodes;
+  const nextTargetPath = findPath(result.nodes, targetId);
+  if (!nextTargetPath) return nodes;
+  if (mode === "inside") {
+    return insertAtPath(result.nodes, nextTargetPath, getAtPath(result.nodes, nextTargetPath)?.children.length ?? 0, result.removed);
+  }
+  return insertAtPath(result.nodes, nextTargetPath.slice(0, -1), nextTargetPath[nextTargetPath.length - 1], result.removed);
+}
+
+function sourceLabel(source: SourceType) {
+  return {
+    notion: "Notion",
+    "google-drive": "Drive",
+    gmail: "Gmail",
+    "google-calendar": "Calendar",
+    github: "GitHub",
+    cloudflare: "Cloudflare",
+    local: "Local",
+  }[source];
+}
+
+function sourceTypeForCollection(collection: ApiCollection): SourceType {
+  if (collection.kind === "drive_files") return "google-drive";
+  if (collection.kind === "calendar_events") return "google-calendar";
+  if (collection.kind === "gmail_messages") return "gmail";
+  return "cloudflare";
+}
+
+function fieldTypeForApi(type: string | undefined): Field["type"] {
+  return {
+    title: "title",
+    text: "text",
+    rich_text: "text",
+    status: "status",
+    select: "select",
+    multi_select: "multi",
+    date: "datetime",
+    number: "number",
+    url: "url",
+    email: "email",
+    person: "person",
+    people: "person",
+    checkbox: "checkbox",
+  }[type ?? "text"] as Field["type"];
+}
+
+function valueFromApi(value: unknown): RecordValue {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.map((item) => (typeof item === "string" ? item : JSON.stringify(item)));
+  return JSON.stringify(value);
+}
+
+function titleKeyForFields(fields: Field[]) {
+  return fields.find((field) => field.type === "title")?.key ?? fields[0]?.key ?? "title";
+}
+
+function liveViewsFor(collection: ApiCollection, fields: Field[]): DatabaseView[] {
+  const visibleFields = fields.slice(0, Math.min(7, fields.length)).map((field) => field.key);
+  const dateField = fields.find((field) => field.type === "date" || field.type === "datetime")?.key;
+  const statusField = fields.find((field) => field.type === "status" || field.key === "status")?.key;
+  const views: DatabaseView[] = [{ id: `${collection.id}-table`, name: "Table", type: "table", fields: visibleFields, sortBy: dateField }];
+  if (statusField) views.push({ id: `${collection.id}-board`, name: "Board", type: "board", fields: visibleFields, groupBy: statusField });
+  views.push({ id: `${collection.id}-list`, name: "List", type: "list", fields: visibleFields, sortBy: dateField });
+  if (collection.kind === "calendar_events" && dateField) {
+    views.push({ id: `${collection.id}-calendar`, name: "Calendar", type: "calendar", fields: visibleFields, sortBy: dateField });
+  }
+  if (collection.kind === "drive_files") {
+    views.push({ id: `${collection.id}-gallery`, name: "Gallery", type: "gallery", fields: visibleFields, sortBy: dateField });
+  }
+  return views;
+}
+
+function databaseFromApi(collection: ApiCollection, records: ApiRecord[]): Database {
+  const sourceType = sourceTypeForCollection(collection);
+  const schemaFields = Object.entries(collection.schema ?? {}).map(([key, value]) => ({
+    key,
+    label: key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()),
+    type: fieldTypeForApi(value?.type),
+    width: key === "snippet" ? 320 : key === "name" || key === "subject" || key === "summary" ? 260 : 160,
+    sourceKey: key,
+  }));
+  const statusField: Field = { key: "status", label: "Status", type: "status", width: 120, sourceKey: "status" };
+  const fields = schemaFields.some((field) => field.key === "status") ? schemaFields : [...schemaFields, statusField];
+  const titleKey = titleKeyForFields(fields);
+  const writeback = sourceType === "google-calendar" ? "supported" : "explicit-only";
+  const mappedRecords: RecordItem[] = records.map((record) => {
+    const values = Object.fromEntries(Object.entries(record.properties ?? {}).map(([key, value]) => [key, valueFromApi(value)]));
+    return {
+      id: record.id,
+      ...values,
+      [titleKey]: valueFromApi(record.properties?.[titleKey]) ?? record.title,
+      status: record.status,
+      _summary: valueFromApi(record.content?.summary ?? record.content?.snippet ?? record.content?.description) as string | undefined,
+      _links: record.url ? [record.url] : [],
+      _source: {
+        type: sourceType,
+        id: record.externalId ?? record.id,
+        url: record.url ?? undefined,
+        collectionId: collection.id,
+        capturedAt: record.lastSyncedAt ?? new Date().toISOString(),
+        writeback,
+      },
+    };
+  });
+  return {
+    id: collection.id,
+    name: collection.name,
+    shortName: sourceLabel(sourceType),
+    category: "Google Workspace",
+    description: `${collection.name} mirrored from the live Cloudflare Google Workspace sync.`,
+    source: `Cloudflare mirror: ${collection.externalId ?? collection.id}`,
+    sync: {
+      sourceType,
+      sourceId: collection.id,
+      state: "connected",
+      lastSyncedAt: collection.lastSyncedAt ?? new Date().toISOString(),
+      writeback,
+      notes: sourceType === "google-calendar" ? "Calendar records can be edited through the supported writeback boundary." : "Mirrored read sync with explicit user-triggered writeback only.",
+    },
+    fields,
+    views: liveViewsFor(collection, fields),
+    records: mappedRecords,
+    template: Object.fromEntries(fields.map((field) => [field.key, field.type === "multi" ? [] : ""])),
+  };
+}
+
+function mergeLiveDatabases(current: Database[], live: Database[]) {
+  const liveIds = new Set(live.map((database) => database.id));
+  return [...current.filter((database) => !liveIds.has(database.id)), ...live];
+}
+
+async function fetchLiveDatabases(apiBase: string): Promise<Database[]> {
+  const base = apiBase.replace(/\/$/, "");
+  const [collectionsResponse, recordsResponse] = await Promise.all([
+    fetch(`${base}/collections?sourceId=google-mab`),
+    fetch(`${base}/records?sourceId=google-mab&limit=250`),
+  ]);
+  if (!collectionsResponse.ok || !recordsResponse.ok) {
+    throw new Error(`Live mirror read failed: collections ${collectionsResponse.status}, records ${recordsResponse.status}`);
+  }
+  const collectionsBody = (await collectionsResponse.json()) as ApiEnvelope<ApiCollection[]>;
+  const recordsBody = (await recordsResponse.json()) as ApiEnvelope<ApiRecord[]>;
+  const recordsByCollection = new Map<string, ApiRecord[]>();
+  for (const record of recordsBody.data ?? []) {
+    recordsByCollection.set(record.collectionId, [...(recordsByCollection.get(record.collectionId) ?? []), record]);
+  }
+  return (collectionsBody.data ?? []).map((collection) => databaseFromApi(collection, recordsByCollection.get(collection.id) ?? []));
+}
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+export default function App() {
+  const [workspace, setWorkspace] = useState<WorkspaceState>(loadWorkspace);
+  const [activeDbId, setActiveDbId] = useState(workspace.databases[0]?.id ?? "clients");
+  const [activeOutlineId, setActiveOutlineId] = useState(workspace.outline[0]?.id ?? "");
+  const [mode, setMode] = useState<"structure" | "database">("structure");
+  const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [showBuilder, setShowBuilder] = useState(true);
+  const [activePanel, setActivePanel] = useState<"builder" | "sources" | "outbox" | "runs">("builder");
+  const [liveStatus, setLiveStatus] = useState<"loading" | "connected" | "error">("loading");
+
+  const activeDb = workspace.databases.find((database) => database.id === activeDbId) ?? workspace.databases[0];
+  const activeOutline = findPath(workspace.outline, activeOutlineId) ? getAtPath(workspace.outline, findPath(workspace.outline, activeOutlineId) ?? []) : workspace.outline[0];
+  const [viewByDb, setViewByDb] = useState<Record<string, string>>(
+    Object.fromEntries(workspace.databases.map((database) => [database.id, database.views[0]?.id ?? ""])),
+  );
+  const activeView = activeDb.views.find((view) => view.id === viewByDb[activeDb.id]) ?? activeDb.views[0];
+  const titleField = getTitleField(activeDb);
+
+  const records = useMemo(() => {
+    return activeDb.records
+      .filter((record) => matchesSearch(activeDb, record, query))
+      .filter((record) => !activeView?.filter || valueText(record[activeView.filter.field]).includes(activeView.filter.value));
+  }, [activeDb, activeView, query]);
+
+  const globalResults = useMemo(() => {
+    if (!query.trim()) return [];
+    return workspace.databases.flatMap((database) =>
+      database.records
+        .filter((record) => matchesSearch(database, record, query))
+        .slice(0, 4)
+        .map((record) => ({ database, record, title: valueText(record[getTitleField(database).key]) || "Untitled" })),
+    );
+  }, [workspace.databases, query]);
+
+  const selectedRecord = selectedRecordId ? activeDb.records.find((record) => record.id === selectedRecordId) ?? null : null;
+
+  const updateWorkspace = (next: WorkspaceState) => {
+    setWorkspace(next);
+    saveWorkspace(next);
+  };
+
+  const updateOutline = (outline: OutlineNode[]) => {
+    updateWorkspace({ ...workspace, outline });
+  };
+
+  const renameOutlineNode = (id: string, title: string) => {
+    updateOutline(updateOutlineNode(workspace.outline, id, (node) => ({ ...node, title })));
+  };
+
+  const addOutlineChild = (parentId: string, type: OutlineNodeType = "theme") => {
+    const child = newOutlineNode(type);
+    updateOutline(updateOutlineNode(workspace.outline, parentId, (node) => ({ ...node, children: [...node.children, child] })));
+    setActiveOutlineId(child.id);
+    setMode("structure");
+  };
+
+  const addOutlineTitle = () => {
+    const title = newOutlineNode("title");
+    updateOutline([...workspace.outline, title]);
+    setActiveOutlineId(title.id);
+    setMode("structure");
+  };
+
+  const duplicateOutline = (id: string) => {
+    updateOutline(duplicateOutlineNode(workspace.outline, id));
+  };
+
+  const deleteOutline = (id: string) => {
+    const next = deleteOutlineNode(workspace.outline, id);
+    updateOutline(next);
+    if (activeOutlineId === id) setActiveOutlineId(next[0]?.id ?? "");
+  };
+
+  const toggleOutlineTodo = (id: string, checked: boolean) => {
+    updateOutline(updateOutlineNode(workspace.outline, id, (node) => ({ ...node, checked })));
+  };
+
+  const moveOutline = (id: string, direction: "up" | "down" | "indent" | "outdent") => {
+    updateOutline(moveOutlineNode(workspace.outline, id, direction));
+  };
+
+  const dropOutline = (draggedId: string, targetId: string, dropMode: "before" | "inside") => {
+    updateOutline(dropOutlineNode(workspace.outline, draggedId, targetId, dropMode));
+  };
+
+  const renameDatabase = (name: string) => {
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) => (database.id === activeDb.id ? { ...database, name } : database)),
+      outline: updateOutlineNode(workspace.outline, `outline-${activeDb.id}`, (node) => ({ ...node, title: name })),
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLiveDatabases(workspace.apiBase)
+      .then((liveDatabases) => {
+        if (cancelled || liveDatabases.length === 0) return;
+        setWorkspace((current) => {
+          const nextDatabases = mergeLiveDatabases(current.databases, liveDatabases);
+          const next = { ...current, databases: nextDatabases, outline: withLiveOutline(current.outline, liveDatabases) };
+          saveWorkspace(next);
+          return next;
+        });
+        setViewByDb((current) => ({
+          ...Object.fromEntries(liveDatabases.map((database) => [database.id, database.views[0]?.id ?? ""])),
+          ...current,
+        }));
+        setActiveDbId((current) => (current === "clients" ? liveDatabases[0].id : current));
+        setLiveStatus("connected");
+      })
+      .catch(() => {
+        if (!cancelled) setLiveStatus("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.apiBase]);
+
+  const queueOperation = (
+    database: Database,
+    recordId: string,
+    action: OutboxOperation["action"],
+    field: string | undefined,
+    value: RecordValue,
+    note?: string,
+  ) => {
+    const nextOperation: OutboxOperation = {
+      id: makeId("outbox"),
+      source: database.sync.sourceType,
+      collectionId: database.sync.sourceId,
+      recordId,
+      action,
+      field,
+      value,
+      createdAt: new Date().toISOString(),
+      status: database.sync.writeback === "supported" ? "ready" : "blocked",
+      note: note ?? `${sourceLabel(database.sync.sourceType)} ${action} queued from local edit.`,
+    };
+    return nextOperation;
+  };
+
+  const updateRecord = (recordId: string, key: string, value: RecordValue) => {
+    const field = getField(activeDb, key);
+    if (field?.readOnly) return;
+    const op = queueOperation(activeDb, recordId, "update", field?.sourceKey ?? key, value);
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) =>
+        database.id === activeDb.id
+          ? {
+              ...database,
+              records: database.records.map((record) => (record.id === recordId ? { ...record, [key]: value } : record)),
+            }
+          : database,
+      ),
+      outbox: [op, ...workspace.outbox],
+    });
+  };
+
+  const addRecord = () => {
+    const nextRecord: RecordItem = {
+      id: makeId(activeDb.id),
+      ...activeDb.template,
+      _source: {
+        type: "local",
+        id: "local-draft",
+        collectionId: activeDb.sync.sourceId,
+        capturedAt: new Date().toISOString(),
+        writeback: activeDb.sync.writeback === "supported" ? "supported" : "planned",
+      },
+    };
+    const op = queueOperation(activeDb, nextRecord.id, "create", undefined, undefined, "New local record queued for source creation.");
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) =>
+        database.id === activeDb.id ? { ...database, records: [nextRecord, ...database.records] } : database,
+      ),
+      outbox: [op, ...workspace.outbox],
+    });
+    setSelectedRecordId(nextRecord.id);
+  };
+
+  const duplicateRecord = (record: RecordItem) => {
+    const title = valueText(record[titleField.key]);
+    const nextRecord: RecordItem = {
+      ...record,
+      id: makeId(activeDb.id),
+      [titleField.key]: `${title} copy`,
+      _source: {
+        type: "local",
+        id: "local-duplicate",
+        collectionId: activeDb.sync.sourceId,
+        capturedAt: new Date().toISOString(),
+        writeback: activeDb.sync.writeback === "supported" ? "supported" : "planned",
+      },
+    };
+    const op = queueOperation(activeDb, nextRecord.id, "create", undefined, undefined, "Duplicated local record queued for source creation.");
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) =>
+        database.id === activeDb.id ? { ...database, records: [nextRecord, ...database.records] } : database,
+      ),
+      outbox: [op, ...workspace.outbox],
+    });
+    setSelectedRecordId(nextRecord.id);
+  };
+
+  const deleteRecord = (recordId: string) => {
+    const op = queueOperation(activeDb, recordId, "delete", undefined, undefined, "Delete queued but requires explicit confirmation before source writeback.");
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) =>
+        database.id === activeDb.id
+          ? { ...database, records: database.records.filter((record) => record.id !== recordId) }
+          : database,
+      ),
+      outbox: [{ ...op, status: "blocked" }, ...workspace.outbox],
+    });
+    setSelectedRecordId(null);
+  };
+
+  const updateView = (patch: Partial<DatabaseView>) => {
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) =>
+        database.id === activeDb.id
+          ? {
+              ...database,
+              views: database.views.map((view) => (view.id === activeView.id ? { ...view, ...patch } : view)),
+            }
+          : database,
+      ),
+    });
+  };
+
+  const addView = (type: ViewType) => {
+    const newView: DatabaseView = {
+      id: makeId("view"),
+      name: `${type[0].toUpperCase()}${type.slice(1)}`,
+      type,
+      fields: activeDb.fields.slice(0, Math.min(6, activeDb.fields.length)).map((field) => field.key),
+      groupBy: activeDb.fields.find((field) => field.type === "status")?.key,
+      sortBy: activeDb.fields.find((field) => field.type === "date" || field.type === "datetime")?.key,
+    };
+    updateWorkspace({
+      ...workspace,
+      databases: workspace.databases.map((database) =>
+        database.id === activeDb.id ? { ...database, views: [...database.views, newView] } : database,
+      ),
+    });
+    setViewByDb({ ...viewByDb, [activeDb.id]: newView.id });
+  };
+
+  const resetWorkspace = () => {
+    const next = seedState();
+    updateWorkspace(next);
+    setActiveDbId(next.databases[0].id);
+    setActiveOutlineId(next.outline[0]?.id ?? "");
+    setMode("structure");
+    setSelectedRecordId(null);
+    setViewByDb(Object.fromEntries(next.databases.map((database) => [database.id, database.views[0]?.id ?? ""])));
+  };
+
+  const exportJson = () => {
+    const blob = new Blob([JSON.stringify(workspace, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `mab-database-os-export-${todayIso()}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const syncNow = async () => {
+    const queuedRun: SyncRun = {
+      id: makeId("sync"),
+      source: "cloudflare",
+      status: "queued",
+      startedAt: new Date().toISOString(),
+      recordsSeen: workspace.databases.reduce((sum, database) => sum + database.records.length, 0),
+      message: `Sync request queued against ${workspace.apiBase}.`,
+    };
+    updateWorkspace({ ...workspace, syncRuns: [queuedRun, ...workspace.syncRuns] });
+
+    try {
+      const response = await fetch(`${workspace.apiBase.replace(/\/$/, "")}/api/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestedAt: new Date().toISOString(), sources: sourceConnections.map((connection) => connection.id) }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const body = (await response.json()) as { message?: string; recordsSeen?: number };
+      const finished: SyncRun = {
+        ...queuedRun,
+        status: "success",
+        finishedAt: new Date().toISOString(),
+        recordsSeen: body.recordsSeen ?? queuedRun.recordsSeen,
+        message: body.message ?? "Cloudflare sync accepted the request.",
+      };
+      updateWorkspace({ ...workspace, syncRuns: [finished, ...workspace.syncRuns.filter((run) => run.id !== queuedRun.id)] });
+    } catch (error) {
+      const failed: SyncRun = {
+        ...queuedRun,
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        message: `Cloudflare backend is not reachable yet: ${error instanceof Error ? error.message : "unknown error"}.`,
+      };
+      updateWorkspace({ ...workspace, syncRuns: [failed, ...workspace.syncRuns.filter((run) => run.id !== queuedRun.id)] });
+    }
+  };
+
+  return (
+    <div className="app-shell">
+      <Sidebar
+        databases={workspace.databases}
+        outline={workspace.outline}
+        connections={sourceConnections}
+        activeOutlineId={activeOutlineId}
+        activeDbId={activeDb.id}
+        onSelectOutline={(id) => {
+          setActiveOutlineId(id);
+          setMode("structure");
+          setSelectedRecordId(null);
+        }}
+        onSelectDatabase={(id) => {
+          setActiveDbId(id);
+          setMode("database");
+          setSelectedRecordId(null);
+        }}
+        onRename={renameOutlineNode}
+        onMove={moveOutline}
+        onDrop={dropOutline}
+        onDuplicate={duplicateOutline}
+        onDelete={deleteOutline}
+      />
+      <main className="workspace">
+        {mode === "structure" ? (
+          <StructureWorkspace
+            outline={workspace.outline}
+            activeOutline={activeOutline}
+            databases={workspace.databases}
+            query={query}
+            setQuery={setQuery}
+            liveStatus={liveStatus}
+            apiBase={workspace.apiBase}
+            setApiBase={(apiBase) => updateWorkspace({ ...workspace, apiBase })}
+            onAddTitle={addOutlineTitle}
+            onAddChild={addOutlineChild}
+            onRename={renameOutlineNode}
+            onMove={moveOutline}
+            onDrop={dropOutline}
+            onDuplicate={duplicateOutline}
+            onDelete={deleteOutline}
+            onToggleTodo={toggleOutlineTodo}
+            onOpenDatabase={(databaseId) => {
+              setActiveDbId(databaseId);
+              setMode("database");
+              setSelectedRecordId(null);
+            }}
+            onExport={exportJson}
+            onReset={resetWorkspace}
+            onSync={syncNow}
+          />
+        ) : (
+          <>
+            <Header
+              database={activeDb}
+              view={activeView}
+              records={records}
+              query={query}
+              setQuery={setQuery}
+              onAdd={addRecord}
+              onExport={exportJson}
+              onReset={resetWorkspace}
+              onSync={syncNow}
+              showBuilder={showBuilder}
+              setShowBuilder={setShowBuilder}
+              apiBase={workspace.apiBase}
+              setApiBase={(apiBase) => updateWorkspace({ ...workspace, apiBase })}
+              onRenameDatabase={renameDatabase}
+            />
+            <Dashboard databases={workspace.databases} outbox={workspace.outbox} conflicts={workspace.conflicts} activeDb={activeDb} />
+            {globalResults.length > 0 && (
+              <GlobalResults
+                results={globalResults}
+                onOpen={(databaseId, recordId) => {
+                  setActiveDbId(databaseId);
+                  setSelectedRecordId(recordId);
+                }}
+              />
+            )}
+            <ViewTabs
+              views={activeDb.views}
+              activeViewId={activeView.id}
+              onSelect={(id) => setViewByDb({ ...viewByDb, [activeDb.id]: id })}
+              onAddView={addView}
+            />
+            <section className={`content-grid ${showBuilder ? "with-builder" : ""}`}>
+              <div className="database-surface">
+                <DatabaseRenderer
+                  database={activeDb}
+                  view={activeView}
+                  records={records}
+                  onOpen={setSelectedRecordId}
+                  onUpdate={updateRecord}
+                />
+              </div>
+              {showBuilder && (
+                <RightPanel
+                  activePanel={activePanel}
+                  setActivePanel={setActivePanel}
+                  database={activeDb}
+                  view={activeView}
+                  onUpdateView={updateView}
+                  connections={sourceConnections}
+                  outbox={workspace.outbox}
+                  conflicts={workspace.conflicts}
+                  syncRuns={workspace.syncRuns}
+                />
+              )}
+            </section>
+          </>
+        )}
+      </main>
+      {selectedRecord && (
+        <RecordDrawer
+          database={activeDb}
+          record={selectedRecord}
+          onClose={() => setSelectedRecordId(null)}
+          onUpdate={updateRecord}
+          onDuplicate={duplicateRecord}
+          onDelete={deleteRecord}
+        />
+      )}
+    </div>
+  );
+}
+
+function Sidebar({
+  databases,
+  outline,
+  connections,
+  activeOutlineId,
+  activeDbId,
+  onSelectOutline,
+  onSelectDatabase,
+  onRename,
+  onMove,
+  onDrop,
+  onDuplicate,
+  onDelete,
+}: {
+  databases: Database[];
+  outline: OutlineNode[];
+  connections: SourceConnection[];
+  activeOutlineId: string;
+  activeDbId: string;
+  onSelectOutline: (id: string) => void;
+  onSelectDatabase: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  const totalRecords = databases.reduce((sum, database) => sum + database.records.length, 0);
+  return (
+    <aside className="sidebar">
+      <div className="brand">
+        <div className="brand-mark">MAB</div>
+        <div>
+          <strong>Database OS</strong>
+          <span>{totalRecords} mirrored records</span>
+        </div>
+      </div>
+      <div className="side-search-card">
+        <span>Workspace</span>
+        <strong>{connections.filter((connection) => connection.state === "snapshot" || connection.state === "connected").length} connected sources</strong>
+        <small>Pages, blocks, databases, and source records.</small>
+      </div>
+      <nav className="nav-groups">
+        {outline.map((node) => (
+          <OutlineTreeItem
+            key={node.id}
+            node={node}
+            level={0}
+            databases={databases}
+            activeOutlineId={activeOutlineId}
+            activeDbId={activeDbId}
+            onSelectOutline={onSelectOutline}
+            onSelectDatabase={onSelectDatabase}
+            onRename={onRename}
+            onMove={onMove}
+            onDrop={onDrop}
+            onDuplicate={onDuplicate}
+            onDelete={onDelete}
+          />
+        ))}
+      </nav>
+    </aside>
+  );
+}
+
+function OutlineTreeItem({
+  node,
+  level,
+  databases,
+  activeOutlineId,
+  activeDbId,
+  onSelectOutline,
+  onSelectDatabase,
+  onRename,
+  onMove,
+  onDrop,
+  onDuplicate,
+  onDelete,
+}: {
+  node: OutlineNode;
+  level: number;
+  databases: Database[];
+  activeOutlineId: string;
+  activeDbId: string;
+  onSelectOutline: (id: string) => void;
+  onSelectDatabase: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  const database = node.databaseId ? databases.find((item) => item.id === node.databaseId) : null;
+  const isActive = node.databaseId ? node.databaseId === activeDbId : node.id === activeOutlineId;
+  const select = () => {
+    if (node.databaseId) onSelectDatabase(node.databaseId);
+    else onSelectOutline(node.id);
+  };
+  return (
+    <div
+      className={`outline-tree-item level-${Math.min(level, 4)}`}
+      draggable
+      onDragStart={(event) => event.dataTransfer.setData("text/plain", node.id)}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        const draggedId = event.dataTransfer.getData("text/plain");
+        if (draggedId) onDrop(draggedId, node.id, event.altKey ? "inside" : "before");
+      }}
+    >
+      <div className={`outline-row ${isActive ? "active" : ""}`}>
+        <button className="outline-open" onClick={select}>
+          <span>{outlineTypeLabel(node.type)}</span>
+          <strong>{database?.shortName ?? node.title.slice(0, 2).toUpperCase()}</strong>
+        </button>
+        <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
+        {database && <em>{database.records.length}</em>}
+        <div className="move-controls">
+          <button title="Duplicate" onClick={() => onDuplicate(node.id)}>Copy</button>
+          <button title="Move up" onClick={() => onMove(node.id, "up")}>Up</button>
+          <button title="Move down" onClick={() => onMove(node.id, "down")}>Down</button>
+          <button title="Indent" onClick={() => onMove(node.id, "indent")}>In</button>
+          <button title="Outdent" onClick={() => onMove(node.id, "outdent")}>Out</button>
+          <button title="Delete" onClick={() => onDelete(node.id)}>Del</button>
+        </div>
+      </div>
+      {node.children.length > 0 && (
+        <div className="outline-children">
+          {node.children.map((child) => (
+            <OutlineTreeItem
+              key={child.id}
+              node={child}
+              level={level + 1}
+              databases={databases}
+              activeOutlineId={activeOutlineId}
+              activeDbId={activeDbId}
+              onSelectOutline={onSelectOutline}
+              onSelectDatabase={onSelectDatabase}
+              onRename={onRename}
+              onMove={onMove}
+              onDrop={onDrop}
+              onDuplicate={onDuplicate}
+              onDelete={onDelete}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StructureWorkspace({
+  outline,
+  activeOutline,
+  databases,
+  query,
+  setQuery,
+  liveStatus,
+  apiBase,
+  setApiBase,
+  onAddChild,
+  onAddTitle,
+  onRename,
+  onMove,
+  onDrop,
+  onDuplicate,
+  onDelete,
+  onToggleTodo,
+  onOpenDatabase,
+  onExport,
+  onReset,
+  onSync,
+}: {
+  outline: OutlineNode[];
+  activeOutline: OutlineNode | null;
+  databases: Database[];
+  query: string;
+  setQuery: (value: string) => void;
+  liveStatus: "loading" | "connected" | "error";
+  apiBase: string;
+  setApiBase: (value: string) => void;
+  onAddChild: (parentId: string, type?: OutlineNodeType) => void;
+  onAddTitle: () => void;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+  onToggleTodo: (id: string, checked: boolean) => void;
+  onOpenDatabase: (databaseId: string) => void;
+  onExport: () => void;
+  onReset: () => void;
+  onSync: () => void;
+}) {
+  const totalRecords = databases.reduce((sum, database) => sum + database.records.length, 0);
+  const selected = activeOutline ?? outline[0] ?? null;
+  return (
+    <section className="structure-workspace notion-shell">
+      <header className="notion-topbar">
+        <div className="breadcrumb">
+          <span>Private</span>
+          <span>/</span>
+          <strong>{selected?.title ?? "Workspace"}</strong>
+        </div>
+        <div className="notion-actions">
+          <input className="notion-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${totalRecords} records`} />
+          <button onClick={onAddTitle}>New page</button>
+          <button onClick={onSync}>Sync</button>
+          <button onClick={onExport}>Export</button>
+          <details className="sync-details">
+            <summary>Settings</summary>
+            <div>
+              <label>
+                <span>Sync API</span>
+                <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
+              </label>
+              <button onClick={onReset}>Reset mirror</button>
+            </div>
+          </details>
+        </div>
+      </header>
+      <header className="structure-header">
+        <div>
+          <p className="eyebrow">MAB AI Strategies</p>
+          <input
+            className="editable-title"
+            value={selected?.title ?? "Workspace"}
+            onChange={(event) => selected && onRename(selected.id, event.target.value)}
+            aria-label="Rename selected structure item"
+          />
+          <p className="subtle">Type into any block. Use the slash menu or block handles to build pages, sections, databases, and source references.</p>
+        </div>
+      </header>
+      <div className="structure-status">
+        <span className={`status-dot ${liveStatus === "connected" ? "connected" : liveStatus === "loading" ? "syncing" : "error"}`} />
+        <strong>{totalRecords} records</strong>
+        <span>{databases.length} databases nested inside your structure</span>
+        <span>{liveStatus === "connected" ? "Live Google Workspace mirror loaded" : liveStatus === "loading" ? "Loading live mirror" : "Live mirror unavailable; local cache active"}</span>
+      </div>
+      {selected && (
+        <div className="structure-toolbar">
+          <span>Selected: {outlineTypeLabel(selected.type)}</span>
+          <button onClick={() => onAddChild(selected.id, "text")}>Text</button>
+          <button onClick={() => onAddChild(selected.id, "todo")}>To-do</button>
+          <button onClick={() => onAddChild(selected.id, "heading")}>Add heading</button>
+          <button onClick={() => onAddChild(selected.id, "subheading")}>Add subheading</button>
+          <button onClick={() => onAddChild(selected.id, "theme")}>Add theme</button>
+          <button onClick={() => onAddChild(selected.id, "divider")}>Divider</button>
+          <button onClick={() => onDuplicate(selected.id)}>Duplicate</button>
+          <button onClick={() => onMove(selected.id, "up")}>Move up</button>
+          <button onClick={() => onMove(selected.id, "down")}>Move down</button>
+          <button onClick={() => onMove(selected.id, "indent")}>Indent</button>
+          <button onClick={() => onMove(selected.id, "outdent")}>Outdent</button>
+          <button onClick={() => onDelete(selected.id)}>Delete</button>
+        </div>
+      )}
+      <div className="outline-canvas">
+        {outline.map((node) => (
+          <OutlineCanvasNode
+            key={node.id}
+            node={node}
+            level={0}
+            databases={databases}
+            query={query}
+            onRename={onRename}
+            onMove={onMove}
+            onDrop={onDrop}
+            onDuplicate={onDuplicate}
+            onDelete={onDelete}
+            onToggleTodo={onToggleTodo}
+            onAddChild={onAddChild}
+            onOpenDatabase={onOpenDatabase}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OutlineCanvasNode({
+  node,
+  level,
+  databases,
+  query,
+  onRename,
+  onMove,
+  onDrop,
+  onDuplicate,
+  onDelete,
+  onToggleTodo,
+  onAddChild,
+  onOpenDatabase,
+}: {
+  node: OutlineNode;
+  level: number;
+  databases: Database[];
+  query: string;
+  onRename: (id: string, title: string) => void;
+  onMove: (id: string, direction: "up" | "down" | "indent" | "outdent") => void;
+  onDrop: (draggedId: string, targetId: string, mode: "before" | "inside") => void;
+  onDuplicate: (id: string) => void;
+  onDelete: (id: string) => void;
+  onToggleTodo: (id: string, checked: boolean) => void;
+  onAddChild: (parentId: string, type?: OutlineNodeType) => void;
+  onOpenDatabase: (databaseId: string) => void;
+}) {
+  const database = node.databaseId ? databases.find((item) => item.id === node.databaseId) : null;
+  const matchingRecords = database?.records.filter((record) => matchesSearch(database, record, query)).slice(0, 4) ?? [];
+  const titleField = database ? getTitleField(database) : null;
+  return (
+    <article
+      className={`canvas-node ${node.type} ${node.checked ? "done" : ""} level-${Math.min(level, 5)}`}
+      draggable
+      onDragStart={(event) => event.dataTransfer.setData("text/plain", node.id)}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        const draggedId = event.dataTransfer.getData("text/plain");
+        if (draggedId) onDrop(draggedId, node.id, event.altKey ? "inside" : "before");
+      }}
+    >
+      <div className="canvas-line">
+        <button className="block-handle" title="Drag block">::</button>
+        {node.type === "todo" && (
+          <input className="todo-check" type="checkbox" checked={Boolean(node.checked)} onChange={(event) => onToggleTodo(node.id, event.target.checked)} />
+        )}
+        {node.type !== "todo" && <span className="outline-bullet" />}
+        <span className="node-type">{outlineTypeLabel(node.type)}</span>
+        {node.type === "divider" ? (
+          <hr />
+        ) : (
+          <input value={node.title} onChange={(event) => onRename(node.id, event.target.value)} aria-label={`Rename ${node.title}`} />
+        )}
+        {database && <button className="button-link" onClick={() => onOpenDatabase(database.id)}>Open database</button>}
+        <div className="move-controls">
+          <button onClick={() => onAddChild(node.id, "text")}>/</button>
+          <button onClick={() => onDuplicate(node.id)}>Copy</button>
+          <button onClick={() => onMove(node.id, "up")}>Up</button>
+          <button onClick={() => onMove(node.id, "down")}>Down</button>
+          <button onClick={() => onMove(node.id, "indent")}>In</button>
+          <button onClick={() => onMove(node.id, "outdent")}>Out</button>
+          <button onClick={() => onDelete(node.id)}>Del</button>
+        </div>
+      </div>
+      {database && (
+        <div className="data-preview">
+          <div>
+            <strong>{database.records.length} data points</strong>
+            <span>{database.source}</span>
+          </div>
+          {matchingRecords.map((record) => (
+            <button key={record.id} onClick={() => onOpenDatabase(database.id)}>
+              <span>{valueText(record[titleField?.key ?? ""]) || "Untitled"}</span>
+              <small>{record._source?.url ? "reference/source/raw data attached" : "mirrored source record"}</small>
+            </button>
+          ))}
+        </div>
+      )}
+      {!database && (
+        <SlashMenu parentId={node.id} onAddChild={onAddChild} />
+      )}
+      {node.children.length > 0 && (
+        <div className="canvas-children">
+          {node.children.map((child) => (
+            <OutlineCanvasNode
+              key={child.id}
+              node={child}
+              level={level + 1}
+              databases={databases}
+              query={query}
+              onRename={onRename}
+              onMove={onMove}
+              onDrop={onDrop}
+              onDuplicate={onDuplicate}
+              onDelete={onDelete}
+              onToggleTodo={onToggleTodo}
+              onAddChild={onAddChild}
+              onOpenDatabase={onOpenDatabase}
+            />
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function SlashMenu({ parentId, onAddChild }: { parentId: string; onAddChild: (parentId: string, type?: OutlineNodeType) => void }) {
+  return (
+    <div className="slash-menu">
+      <span>/</span>
+      <button onClick={() => onAddChild(parentId, "text")}>Text</button>
+      <button onClick={() => onAddChild(parentId, "todo")}>To-do</button>
+      <button onClick={() => onAddChild(parentId, "heading")}>Heading</button>
+      <button onClick={() => onAddChild(parentId, "subheading")}>Subheading</button>
+      <button onClick={() => onAddChild(parentId, "theme")}>Theme</button>
+      <button onClick={() => onAddChild(parentId, "divider")}>Divider</button>
+    </div>
+  );
+}
+
+function Header({
+  database,
+  view,
+  records,
+  query,
+  setQuery,
+  onAdd,
+  onExport,
+  onReset,
+  onSync,
+  showBuilder,
+  setShowBuilder,
+  apiBase,
+  setApiBase,
+  onRenameDatabase,
+}: {
+  database: Database;
+  view: DatabaseView;
+  records: RecordItem[];
+  query: string;
+  setQuery: (value: string) => void;
+  onAdd: () => void;
+  onExport: () => void;
+  onReset: () => void;
+  onSync: () => void;
+  showBuilder: boolean;
+  setShowBuilder: (value: boolean) => void;
+  apiBase: string;
+  setApiBase: (value: string) => void;
+  onRenameDatabase: (value: string) => void;
+}) {
+  return (
+    <header className="topbar">
+      <div className="title-block">
+        <p className="eyebrow">{database.category} / {sourceLabel(database.sync.sourceType)}</p>
+        <input className="editable-title" value={database.name} onChange={(event) => onRenameDatabase(event.target.value)} aria-label="Rename database" />
+        <p className="subtle">{database.description}</p>
+        <div className="source-line">
+          <span className={`status-dot ${database.sync.state}`} />
+          <span>{database.sync.notes}</span>
+        </div>
+      </div>
+      <div className="top-actions">
+        <label className="command-search">
+          <span>Ask the workspace</span>
+          <input
+            aria-label="Search workspace"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={`Search ${records.length} ${view.name.toLowerCase()} records`}
+          />
+        </label>
+        <label className="api-field">
+          <span>Sync API</span>
+          <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
+        </label>
+        <div className="action-row">
+          <button className="secondary" onClick={() => setShowBuilder(!showBuilder)}>{showBuilder ? "Hide panels" : "Show panels"}</button>
+          <button className="secondary" onClick={onExport}>Export</button>
+          <button className="secondary" onClick={onReset}>Reset mirror</button>
+          <button className="secondary" onClick={onSync}>Sync now</button>
+          <button className="primary" onClick={onAdd}>New record</button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function Dashboard({ databases, outbox, conflicts, activeDb }: { databases: Database[]; outbox: OutboxOperation[]; conflicts: ConflictItem[]; activeDb: Database }) {
+  const deals = databases.find((database) => database.id === "deals");
+  const clients = databases.find((database) => database.id === "clients");
+  const docs = databases.find((database) => database.id === "workspace-docs");
+  const pipelineValue = deals?.records.reduce((sum, record) => sum + Number(recordValue(record.value) || 0), 0) ?? 0;
+  const activeClients = clients?.records.filter((record) => ["Qualified", "Active Client", "In Conversation"].includes(valueText(record.status))).length ?? 0;
+  const sourceTypes = new Set(databases.map((database) => database.sync.sourceType)).size;
+
+  return (
+    <section className="metrics">
+      <Metric label="Mirrored records" value={databases.reduce((sum, database) => sum + database.records.length, 0).toString()} detail={`${databases.length} source-aware collections`} />
+      <Metric label="Pipeline value" value={formatCurrency(pipelineValue)} detail={`${activeClients} client or cohort focus areas`} />
+      <Metric label="Workspace docs" value={(docs?.records.length ?? 0).toString()} detail={`${sourceTypes} source systems represented`} />
+      <Metric label="Writeback queue" value={outbox.length.toString()} detail={`${conflicts.length} conflict or redaction guardrail`} />
+      <Metric label="Current view" value={activeDb.records.length.toString()} detail={`${activeDb.name} records in ${sourceLabel(activeDb.sync.sourceType)}`} />
+    </section>
+  );
+}
+
+function Metric({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <article className="metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
+  );
+}
+
+function SourceDock({ connections, activeSource }: { connections: SourceConnection[]; activeSource: SourceType }) {
+  return (
+    <section className="source-dock">
+      {connections.map((connection) => (
+        <article className={connection.id === activeSource ? "active" : ""} key={connection.id}>
+          <span className={`status-dot ${connection.state}`} />
+          <div>
+            <strong>{connection.name}</strong>
+            <small>{connection.detail}</small>
+          </div>
+          <em>{connection.recordCount}</em>
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function GlobalResults({
+  results,
+  onOpen,
+}: {
+  results: Array<{ database: Database; record: RecordItem; title: string }>;
+  onOpen: (databaseId: string, recordId: string) => void;
+}) {
+  return (
+    <section className="global-results">
+      <span>Cross-source matches</span>
+      <div>
+        {results.slice(0, 8).map(({ database, record, title }) => (
+          <button key={`${database.id}-${record.id}`} onClick={() => onOpen(database.id, record.id)}>
+            <strong>{title}</strong>
+            <small>{database.name} / {sourceLabel(database.sync.sourceType)}</small>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ViewTabs({
+  views,
+  activeViewId,
+  onSelect,
+  onAddView,
+}: {
+  views: DatabaseView[];
+  activeViewId: string;
+  onSelect: (id: string) => void;
+  onAddView: (type: ViewType) => void;
+}) {
+  return (
+    <div className="view-tabs">
+      {views.map((view) => (
+        <button className={view.id === activeViewId ? "active" : ""} key={view.id} onClick={() => onSelect(view.id)}>
+          {view.name}
+          <span>{view.type}</span>
+        </button>
+      ))}
+      <select onChange={(event) => { if (event.target.value) onAddView(event.target.value as ViewType); event.target.value = ""; }} defaultValue="">
+        <option value="" disabled>New view</option>
+        <option value="table">Table</option>
+        <option value="board">Board</option>
+        <option value="list">List</option>
+        <option value="calendar">Calendar</option>
+        <option value="gallery">Gallery</option>
+      </select>
+    </div>
+  );
+}
+
+function DatabaseRenderer({
+  database,
+  view,
+  records,
+  onOpen,
+  onUpdate,
+}: {
+  database: Database;
+  view: DatabaseView;
+  records: RecordItem[];
+  onOpen: (id: string) => void;
+  onUpdate: (id: string, key: string, value: RecordValue) => void;
+}) {
+  if (records.length === 0) return <EmptyState database={database} />;
+  if (view.type === "board") return <BoardView database={database} view={view} records={records} onOpen={onOpen} onUpdate={onUpdate} />;
+  if (view.type === "calendar") return <CalendarView database={database} view={view} records={records} onOpen={onOpen} />;
+  if (view.type === "gallery") return <GalleryView database={database} view={view} records={records} onOpen={onOpen} />;
+  if (view.type === "list") return <ListView database={database} view={view} records={records} onOpen={onOpen} />;
+  return <TableView database={database} view={view} records={records} onOpen={onOpen} onUpdate={onUpdate} />;
+}
+
+function EmptyState({ database }: { database: Database }) {
+  return (
+    <div className="empty-state">
+      <strong>No records in this filtered view.</strong>
+      <p>{database.sync.state === "needs-auth" ? "Connect the source to pull this collection." : "Clear search or create a new record."}</p>
+    </div>
+  );
+}
+
+function TableView({
+  database,
+  view,
+  records,
+  onOpen,
+  onUpdate,
+}: {
+  database: Database;
+  view: DatabaseView;
+  records: RecordItem[];
+  onOpen: (id: string) => void;
+  onUpdate: (id: string, key: string, value: RecordValue) => void;
+}) {
+  const fields = view.fields.map((key) => getField(database, key)).filter(Boolean) as Field[];
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th className="source-th">Source</th>
+            {fields.map((field) => (
+              <th key={field.key} style={{ minWidth: field.width }}>{field.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {records.map((record) => (
+            <tr key={record.id}>
+              <td><SourcePill record={record} fallback={database.sync.sourceType} /></td>
+              {fields.map((field, index) => (
+                <td key={field.key}>
+                  {index === 0 ? (
+                    <button className="record-link" onClick={() => onOpen(record.id)}>{valueText(record[field.key]) || "Untitled"}</button>
+                  ) : (
+                    <EditableCell field={field} value={record[field.key]} onChange={(value) => onUpdate(record.id, field.key, value)} />
+                  )}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function BoardView({
+  database,
+  view,
+  records,
+  onOpen,
+  onUpdate,
+}: {
+  database: Database;
+  view: DatabaseView;
+  records: RecordItem[];
+  onOpen: (id: string) => void;
+  onUpdate: (id: string, key: string, value: RecordValue) => void;
+}) {
+  const groupField = getField(database, view.groupBy ?? "") ?? database.fields.find((field) => field.type === "status" || field.type === "select");
+  const groups = groupField?.options?.map((option) => option.name) ?? Array.from(new Set(records.map((record) => valueText(record[groupField?.key ?? ""]))));
+  const titleField = getTitleField(database);
+  const visibleFields = view.fields.map((key) => getField(database, key)).filter(Boolean) as Field[];
+
+  return (
+    <div className="board">
+      {groups.map((group) => {
+        const groupRecords = records.filter((record) => valueText(record[groupField?.key ?? ""]) === group);
+        return (
+          <section className="board-column" key={group}>
+            <header>
+              <span className={classForOption(groupField, group)}>{group}</span>
+              <small>{groupRecords.length}</small>
+            </header>
+            <div className="board-stack">
+              {groupRecords.map((record) => (
+                <article className="board-card" key={record.id} onClick={() => onOpen(record.id)}>
+                  <div className="card-topline">
+                    <SourcePill record={record} fallback={database.sync.sourceType} />
+                    <small>{database.shortName}</small>
+                  </div>
+                  <strong>{valueText(record[titleField.key])}</strong>
+                  {visibleFields.filter((field) => field.key !== titleField.key).slice(0, 4).map((field) => (
+                    <div className="board-field" key={field.key}>
+                      <span>{field.label}</span>
+                      <FieldValue field={field} value={record[field.key]} />
+                    </div>
+                  ))}
+                  {groupField && !groupField.readOnly && (
+                    <select
+                      value={valueText(record[groupField.key])}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => onUpdate(record.id, groupField.key, event.target.value)}
+                    >
+                      {groupField.options?.map((option) => <option key={option.name}>{option.name}</option>)}
+                    </select>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function ListView({ database, view, records, onOpen }: { database: Database; view: DatabaseView; records: RecordItem[]; onOpen: (id: string) => void }) {
+  const titleField = getTitleField(database);
+  const fields = view.fields.map((key) => getField(database, key)).filter(Boolean) as Field[];
+  return (
+    <div className="list-view">
+      {records.map((record) => (
+        <button className="list-row" key={record.id} onClick={() => onOpen(record.id)}>
+          <SourcePill record={record} fallback={database.sync.sourceType} />
+          <div>
+            <strong>{valueText(record[titleField.key])}</strong>
+            <span>{fields.filter((field) => field.key !== titleField.key).map((field) => `${field.label}: ${valueText(record[field.key])}`).join(" | ")}</span>
+          </div>
+          <span>Open</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CalendarView({ database, view, records, onOpen }: { database: Database; view: DatabaseView; records: RecordItem[]; onOpen: (id: string) => void }) {
+  const dateField = getDateField(database, view);
+  const titleField = getTitleField(database);
+  const allDates = records
+    .map((record) => new Date(valueText(record[dateField?.key ?? ""])))
+    .filter((date) => !Number.isNaN(date.getTime()));
+  const anchor = allDates[0] ?? new Date();
+  const monthStart = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+  const offset = monthStart.getDay();
+  const days = Array.from({ length: 35 }, (_, index) => {
+    const date = new Date(monthStart.getFullYear(), monthStart.getMonth(), 1 + index - offset);
+    const iso = date.toISOString().slice(0, 10);
+    return {
+      date,
+      iso,
+      records: records.filter((record) => valueText(record[dateField?.key ?? ""]).slice(0, 10) === iso),
+    };
+  });
+
+  return (
+    <div className="calendar">
+      {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <strong className="day-label" key={day}>{day}</strong>)}
+      {days.map((day) => (
+        <section className="calendar-day" key={day.iso}>
+          <time>{day.date.getDate()}</time>
+          {day.records.map((record) => (
+            <button key={record.id} onClick={() => onOpen(record.id)}>{valueText(record[titleField.key])}</button>
+          ))}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function GalleryView({ database, view, records, onOpen }: { database: Database; view: DatabaseView; records: RecordItem[]; onOpen: (id: string) => void }) {
+  const titleField = getTitleField(database);
+  const fields = view.fields.map((key) => getField(database, key)).filter(Boolean) as Field[];
+  return (
+    <div className="gallery">
+      {records.map((record) => (
+        <button className="gallery-card" key={record.id} onClick={() => onOpen(record.id)}>
+          <div className="image-fallback">
+            <span>{database.shortName}</span>
+            <SourcePill record={record} fallback={database.sync.sourceType} />
+          </div>
+          <strong>{valueText(record[titleField.key])}</strong>
+          {fields.filter((field) => field.key !== titleField.key).slice(0, 3).map((field) => (
+            <FieldValue key={field.key} field={field} value={record[field.key]} />
+          ))}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RightPanel({
+  activePanel,
+  setActivePanel,
+  database,
+  view,
+  onUpdateView,
+  connections,
+  outbox,
+  conflicts,
+  syncRuns,
+}: {
+  activePanel: "builder" | "sources" | "outbox" | "runs";
+  setActivePanel: (panel: "builder" | "sources" | "outbox" | "runs") => void;
+  database: Database;
+  view: DatabaseView;
+  onUpdateView: (patch: Partial<DatabaseView>) => void;
+  connections: SourceConnection[];
+  outbox: OutboxOperation[];
+  conflicts: ConflictItem[];
+  syncRuns: SyncRun[];
+}) {
+  return (
+    <aside className="right-panel">
+      <div className="panel-tabs">
+        {(["builder", "sources", "outbox", "runs"] as const).map((panel) => (
+          <button className={activePanel === panel ? "active" : ""} key={panel} onClick={() => setActivePanel(panel)}>{panel}</button>
+        ))}
+      </div>
+      {activePanel === "builder" && <ViewBuilder database={database} view={view} onUpdate={onUpdateView} />}
+      {activePanel === "sources" && <SourcesPanel database={database} connections={connections} />}
+      {activePanel === "outbox" && <OutboxPanel outbox={outbox} conflicts={conflicts} />}
+      {activePanel === "runs" && <RunsPanel syncRuns={syncRuns} />}
+    </aside>
+  );
+}
+
+function ViewBuilder({ database, view, onUpdate }: { database: Database; view: DatabaseView; onUpdate: (patch: Partial<DatabaseView>) => void }) {
+  const groupable = database.fields.filter((field) => field.type === "status" || field.type === "select");
+  const sortable = database.fields.filter((field) => field.type === "date" || field.type === "datetime" || field.type === "number" || field.type === "currency" || field.type === "title");
+  const toggleField = (fieldKey: string) => {
+    const fields = view.fields.includes(fieldKey) ? view.fields.filter((key) => key !== fieldKey) : [...view.fields, fieldKey];
+    onUpdate({ fields });
+  };
+
+  return (
+    <div className="builder">
+      <div>
+        <p className="eyebrow">View builder</p>
+        <input className="builder-title" value={view.name} onChange={(event) => onUpdate({ name: event.target.value })} />
+      </div>
+      <label>
+        Layout
+        <select value={view.type} onChange={(event) => onUpdate({ type: event.target.value as ViewType })}>
+          <option value="table">Table</option>
+          <option value="board">Board</option>
+          <option value="list">List</option>
+          <option value="calendar">Calendar</option>
+          <option value="gallery">Gallery</option>
+        </select>
+      </label>
+      <label>
+        Group by
+        <select value={view.groupBy ?? ""} onChange={(event) => onUpdate({ groupBy: event.target.value || undefined })}>
+          <option value="">No grouping</option>
+          {groupable.map((field) => <option key={field.key} value={field.key}>{field.label}</option>)}
+        </select>
+      </label>
+      <label>
+        Sort date/value
+        <select value={view.sortBy ?? ""} onChange={(event) => onUpdate({ sortBy: event.target.value || undefined })}>
+          <option value="">Default order</option>
+          {sortable.map((field) => <option key={field.key} value={field.key}>{field.label}</option>)}
+        </select>
+      </label>
+      <div className="field-picker">
+        <span>Visible properties</span>
+        {database.fields.map((field) => (
+          <label key={field.key} className="check-row">
+            <input type="checkbox" checked={view.fields.includes(field.key)} onChange={() => toggleField(field.key)} />
+            {field.label}
+            <small>{field.type}{field.readOnly ? " / read only" : ""}</small>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SourcesPanel({ database, connections }: { database: Database; connections: SourceConnection[] }) {
+  const active = connections.find((connection) => connection.id === database.sync.sourceType);
+  return (
+    <div className="panel-stack">
+      <section>
+        <p className="eyebrow">Active source</p>
+        <h3>{sourceLabel(database.sync.sourceType)}</h3>
+        <p>{database.source}</p>
+        {database.sync.sourceUrl && <a href={database.sync.sourceUrl} target="_blank" rel="noreferrer">Open source</a>}
+      </section>
+      <section>
+        <p className="eyebrow">Writeback</p>
+        <strong>{database.sync.writeback}</strong>
+        <p>{database.sync.notes}</p>
+      </section>
+      {active && (
+        <section>
+          <p className="eyebrow">Connection</p>
+          <strong>{active.state}</strong>
+          <p>{active.detail}</p>
+          <small>{active.writeback}</small>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function OutboxPanel({ outbox, conflicts }: { outbox: OutboxOperation[]; conflicts: ConflictItem[] }) {
+  return (
+    <div className="panel-stack">
+      <section>
+        <p className="eyebrow">Pending writeback</p>
+        <strong>{outbox.length} operations</strong>
+      </section>
+      {outbox.slice(0, 8).map((op) => (
+        <article className="event-card" key={op.id}>
+          <span className={`op-status ${op.status}`}>{op.status}</span>
+          <strong>{sourceLabel(op.source)} / {op.action}</strong>
+          <p>{op.note}</p>
+          {op.field && <small>{op.field}: {valueText(op.value)}</small>}
+        </article>
+      ))}
+      {conflicts.map((conflict) => (
+        <article className="event-card conflict" key={conflict.id}>
+          <span className="op-status blocked">conflict</span>
+          <strong>{conflict.field}</strong>
+          <p>Local: {valueText(conflict.localValue)} / Remote: {valueText(conflict.remoteValue)}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function RunsPanel({ syncRuns }: { syncRuns: SyncRun[] }) {
+  return (
+    <div className="panel-stack">
+      <section>
+        <p className="eyebrow">Sync history</p>
+        <strong>{syncRuns.length} runs</strong>
+      </section>
+      {syncRuns.map((run) => (
+        <article className="event-card" key={run.id}>
+          <span className={`op-status ${run.status}`}>{run.status}</span>
+          <strong>{sourceLabel(run.source)}</strong>
+          <p>{run.message}</p>
+          <small>{formatDate(run.startedAt)} / {run.recordsSeen} records</small>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function RecordDrawer({
+  database,
+  record,
+  onClose,
+  onUpdate,
+  onDuplicate,
+  onDelete,
+}: {
+  database: Database;
+  record: RecordItem;
+  onClose: () => void;
+  onUpdate: (id: string, key: string, value: RecordValue) => void;
+  onDuplicate: (record: RecordItem) => void;
+  onDelete: (id: string) => void;
+}) {
+  const titleField = getTitleField(database);
+  const source = record._source && typeof record._source === "object" && !Array.isArray(record._source) ? record._source : undefined;
+  return (
+    <aside className="drawer">
+      <header>
+        <div>
+          <p className="eyebrow">{database.name}</p>
+          <h2>{valueText(record[titleField.key]) || "Untitled"}</h2>
+        </div>
+        <button className="icon-button" onClick={onClose}>Close</button>
+      </header>
+      <div className="drawer-actions">
+        <button className="secondary" onClick={() => onDuplicate(record)}>Duplicate</button>
+        {source?.url && <a className="secondary button-link" href={source.url} target="_blank" rel="noreferrer">Open source</a>}
+        <button className="danger" onClick={() => onDelete(record.id)}>Delete</button>
+      </div>
+      <section className="source-card">
+        <SourcePill record={record} fallback={database.sync.sourceType} />
+        <div>
+          <strong>{source?.id ?? database.sync.sourceId}</strong>
+          <span>{source?.writeback ?? database.sync.writeback} writeback / captured {formatDate(source?.capturedAt)}</span>
+        </div>
+      </section>
+      {record._summary && <p className="record-summary">{record._summary}</p>}
+      <div className="property-list">
+        {database.fields.map((field) => (
+          <label className="property-editor" key={field.key}>
+            <span>{field.label}</span>
+            <EditableCell field={field} value={record[field.key]} onChange={(value) => onUpdate(record.id, field.key, value)} expanded />
+          </label>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
+function SourcePill({ record, fallback }: { record: RecordItem; fallback: SourceType }) {
+  const source = record._source && typeof record._source === "object" && !Array.isArray(record._source) ? record._source.type : fallback;
+  return <span className={`source-pill source-${source}`}>{sourceLabel(source)}</span>;
+}
+
+function FieldValue({ field, value }: { field: Field; value: RecordItem[string] }) {
+  if (field.type === "currency") return <span>{formatCurrency(value)}</span>;
+  if (field.type === "date" || field.type === "datetime") return <span>{formatDate(value)}</span>;
+  if (field.type === "checkbox") return <span>{valueText(value)}</span>;
+  if (field.type === "status" || field.type === "select") return <span className={classForOption(field, valueText(value))}>{valueText(value)}</span>;
+  if (field.type === "multi") {
+    return (
+      <span className="multi-pills">
+        {(Array.isArray(recordValue(value)) ? recordValue(value) as string[] : valueText(value).split(",").filter(Boolean)).map((item) => (
+          <span key={item}>{item.trim()}</span>
+        ))}
+      </span>
+    );
+  }
+  if (field.type === "url" && valueText(value)) return <a href={valueText(value)} target="_blank" rel="noreferrer">{valueText(value)}</a>;
+  return <span>{valueText(value)}</span>;
+}
+
+function EditableCell({
+  field,
+  value,
+  onChange,
+  expanded,
+}: {
+  field: Field;
+  value: RecordItem[string];
+  onChange: (value: RecordValue) => void;
+  expanded?: boolean;
+}) {
+  const text = valueText(value);
+  if (field.readOnly) return <div className="read-only"><FieldValue field={field} value={value} /></div>;
+  if (field.type === "status" || field.type === "select") {
+    return (
+      <select className="cell-select" value={text} onChange={(event) => onChange(event.target.value)}>
+        <option value="">Empty</option>
+        {field.options?.map((option) => <option key={option.name}>{option.name}</option>)}
+      </select>
+    );
+  }
+  if (field.type === "checkbox") {
+    return <input type="checkbox" checked={text === "Yes" || text === "true"} onChange={(event) => onChange(event.target.checked)} />;
+  }
+  if (field.type === "multi") {
+    return (
+      <input
+        className="cell-input"
+        value={Array.isArray(recordValue(value)) ? (recordValue(value) as string[]).join(", ") : text}
+        onChange={(event) => onChange(event.target.value.split(",").map((item) => item.trim()).filter(Boolean))}
+      />
+    );
+  }
+  if (field.type === "number" || field.type === "currency") {
+    return <input className="cell-input" type="number" value={text} onChange={(event) => onChange(Number(event.target.value))} />;
+  }
+  if (expanded || field.type === "text") {
+    return <textarea className="cell-input" value={text} rows={expanded || text.length > 80 ? 4 : 1} onChange={(event) => onChange(event.target.value)} />;
+  }
+  return <input className="cell-input" value={text} onChange={(event) => onChange(event.target.value)} />;
+}
