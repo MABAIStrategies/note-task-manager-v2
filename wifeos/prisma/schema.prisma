@@ -1,0 +1,132 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                     String            @id @default(cuid())
+  name                   String
+  notificationPreference String
+  voiceEnabled           Boolean           @default(false)
+  privacyMode            Boolean           @default(true)
+  babyProfiles           BabyProfile[]
+  houseTasks             HouseTask[]
+  supplies               SupplyItem[]
+  creativeProjects       CreativeProject[]
+  rabbitHoles            RabbitHole[]
+  ringEvents             RingEvent[]
+  integrations           IntegrationState[]
+}
+
+model BabyProfile {
+  id           String      @id @default(cuid())
+  userId       String
+  name         String
+  birthDate    DateTime
+  feedingType  String
+  routineNotes String
+  user         User        @relation(fields: [userId], references: [id])
+  events       BabyEvent[]
+}
+
+model BabyEvent {
+  id        String      @id @default(cuid())
+  babyId    String
+  type      BabyEventType
+  timestamp DateTime
+  notes     String
+  mediaUrl  String?
+  baby      BabyProfile @relation(fields: [babyId], references: [id])
+}
+
+model HouseTask {
+  id               String   @id @default(cuid())
+  userId           String
+  room             String
+  taskName         String
+  priority         String
+  estimatedMinutes Int
+  status           String
+  dueDate          DateTime
+  user             User     @relation(fields: [userId], references: [id])
+}
+
+model SupplyItem {
+  id                  String @id @default(cuid())
+  userId              String
+  name                String
+  category            String
+  currentLevel        String
+  estimatedRunoutDate DateTime
+  reorderUrl          String?
+  user                User   @relation(fields: [userId], references: [id])
+}
+
+model CreativeProject {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  input     String
+  output    Json
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model RabbitHole {
+  id                 String        @id @default(cuid())
+  userId             String
+  topic              String
+  summary            String
+  weirdnessScore     Int
+  plausibilityScore  Int
+  entertainmentScore Int
+  createdAt          DateTime      @default(now())
+  user               User          @relation(fields: [userId], references: [id])
+  claims             RabbitClaim[]
+}
+
+model RabbitClaim {
+  id           String     @id @default(cuid())
+  rabbitHoleId String
+  claim        String
+  evidence     String
+  counterpoint String
+  score        Int
+  sourceUrl    String?
+  rabbitHole   RabbitHole @relation(fields: [rabbitHoleId], references: [id])
+}
+
+model RingEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  eventType String
+  timestamp DateTime
+  summary   String
+  imageUrl  String?
+  alertSent Boolean  @default(false)
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model IntegrationState {
+  id             String   @id @default(cuid())
+  userId         String
+  provider       String
+  connected      Boolean  @default(false)
+  summaryOnly    Boolean  @default(true)
+  lastSyncedAt   DateTime?
+  consentVersion String?
+  user           User     @relation(fields: [userId], references: [id])
+}
+
+enum BabyEventType {
+  nap
+  bottle
+  diaper
+  food
+  milestone
+  medicine
+}
